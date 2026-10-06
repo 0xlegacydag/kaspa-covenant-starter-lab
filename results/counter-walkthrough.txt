@@ -1,0 +1,37 @@
+1. Compile
+   locking script size        : 202 bytes
+   state inside the script    : 9 bytes at offset 1
+   count 0 vs count 5         : different script = True
+   same contract template     : True
+
+2. Transitions the Counter accepts
+   count  10, add(  5), claims  15 -> passes
+   count  10, subtract(  3), claims   7 -> passes
+   count  10, subtract( 10), claims   0 -> passes
+
+3. Transitions the Counter refuses
+   count  10, add(  5), claims  14 -> refused
+   count  10, add(  5), claims  16 -> refused
+   count  10, subtract( 11), claims  -1 -> refused
+
+4. Why subtract below zero is refused
+error: script ran, but verification failed
+   --> 13:9
+   |
+12 |     function subtract(State prev_state, int amount) : (State) {
+13 |         require(prev_state.count - amount >= 0);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ verification failed here
+   |   amount = 11, count = 10, init_count = 0, prev_state = {count: 10}
+   |
+
+5. What the Counter does not forbid
+   count  10, add(-20), claims -10 -> passes
+   count  10, subtract( -5), claims  15 -> passes
+   only 1000 of 5000 sompi stay in the covenant           -> passes
+
+6. Stricter variant: both transitions require amount > 0
+   count  10, add(  5), claims  15 -> passes
+   count  10, add(-20), claims -10 -> refused
+   count  10, add(  0), claims  10 -> refused
+   count  10, subtract( -5), claims  15 -> refused
+   only 1000 of 5000 sompi stay in the covenant           -> passes

@@ -1,0 +1,28 @@
+1. Compile
+   contract          : Guard
+   compiler version  : 0.1.0
+   locking script    : 7604b08239998763757682599f6975760164a0697551676a68 (25 bytes)
+   entrypoint        : check(int amount)
+   testnet address   : kaspatest:ppz2tak8unekppun5qk6uul3796scg3ufmegy6dglw7z7rlyxlhuyfpst9f46 (derived only, never funded)
+
+2. Simulated calls of check(amount), threshold = 100
+   amount =  150 -> passes
+   amount =  101 -> passes
+   amount =  100 -> refused
+   amount =   99 -> refused
+   amount =    0 -> refused
+   amount =   -1 -> refused
+
+3. Why a call is refused (amount = 50)
+error: script ran, but verification failed
+   --> 4:9
+   |
+ 3 |     entry check(int amount) {
+ 4 |         require(amount > threshold);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ verification failed here
+   |   amount = 50, threshold = 100
+   |
+
+4. Artifact round trip
+   same locking script after reload : True
+   same unlocking script for 150    : True

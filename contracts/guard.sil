@@ -1,0 +1,6 @@
+pragma silverscript ^0.1.0;
+contract Guard(int threshold) {
+    entry check(int amount) {
+        require(amount > threshold);
+    }
+}

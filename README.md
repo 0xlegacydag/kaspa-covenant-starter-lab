@@ -9,7 +9,9 @@ Steps 1–3 run offline on one computer: no network, no wallet, no coins, no
 token, no deployment. Steps 4 and 5 were also run on testnet-10, with test
 coins only. Nothing here ever touched mainnet.
 
-Last successful run of the offline checks: 2026-10-06, 81 checks, all passing.
+Last successful run of the offline checks: 2026-10-06, 97 checks, all passing.
+`tools/mutation_check.py` weakens one contract rule at a time and reruns them:
+all 36 weakenings were noticed.
 
 ## Step 1 — Guard: a rule that is checked once
 
@@ -58,7 +60,7 @@ Changing the count means spending the coin that sits at the old address and
 creating a coin at the new one; the contract checks that the new coin carries
 the state its rules produce.
 
-Checks: `tests/test_counter.py` (26). Actual output of the walkthrough:
+Checks: `tests/test_counter.py` (27). Actual output of the walkthrough:
 `results/counter-walkthrough.txt`.
 
 | Question | Result |
@@ -67,8 +69,8 @@ Checks: `tests/test_counter.py` (26). Actual output of the walkthrough:
 | Is it still "the same contract" across states? | Yes: the template hash is identical for every count. |
 | Which transitions pass? | 10 `add(5)` -> 15; 10 `subtract(3)` -> 7; 10 `subtract(10)` -> 0. |
 | Can the spender claim a different result? | No: 10 `add(5)` claiming 14, 16, 10 or 0 is refused. |
-| Is going below zero refused? | Yes: 10 `subtract(11)` fails at the `require` line. |
-| Must the covenant continue in exactly one output? | Yes: no output, two covenant outputs, an output without a covenant binding, or one bound to another covenant id are all refused. |
+| Is going below zero refused? | Yes: 10 `subtract(11)` fails at the `require` line. This holds from a non-negative start only: a contract cannot check the count it was created with. |
+| Must the covenant continue in exactly one output? | Yes: no output, two covenant outputs, an output without a covenant binding, or an output that starts another covenant are all refused by the contract (a contract with no covenant rules accepts the same transactions). A made-up covenant id is rejected even earlier, before any contract code runs. |
 | Can the count overflow? | No: adding 1 to 2^63-1 is refused. |
 | Do the checks notice a removed rule? | Yes: without the `require` in `subtract`, a check fails. |
 
@@ -112,20 +114,28 @@ state (see SilverScript's
 [covenant declarations](https://github.com/kaspanet/silverscript/blob/v1.0.0/docs/DECL.md))
 — not by a fixed position in the transaction.
 
-Checks: `tests/test_counter_value.py` (15). The walkthrough output is in
+Checks: `tests/test_counter_value.py` (14, most of them run over both
+transitions and several transaction shapes). The walkthrough output is in
 `results/counter-walkthrough.txt`, sections 7 and 8.
+
+A note on how a refusal is pinned to this rule. The engine reports a failure
+of the compiler-generated checks (wrong next state, not exactly one covenant
+output) at the last statement of the function, which here is the value rule.
+So the line number alone does not say which rule refused. The checks
+therefore compare: the very same transaction is refused by KeepingCounter
+and accepted by StrictCounter, which differs only by the value rule.
 
 | Question | Result |
 | --- | --- |
 | Does a transition that keeps every coin pass? | Yes, for `add` and `subtract`. |
-| Is losing a single sompi refused? | Yes, at the value rule. |
-| Is the leak from step 2 refused? | Yes: 1000 of 5000 staying is refused, whichever order the outputs are in. |
+| Is losing a single sompi refused? | Yes, in `add` and in `subtract`; the same transaction passes without the value rule. |
+| Is the leak from step 2 refused? | Yes, in both transitions: 1000 of 5000 staying is refused, whichever order the outputs are in. |
 | Can the leak hide behind a big first output? | No: refused. |
 | Can the fee come from somewhere else? | Yes: with a separate input covering it, the covenant keeps all 5000 and the transition passes. |
 | Can coins be added to the covenant? | Yes: a top-up from a separate input passes. |
-| Must the covenant output be first? | No. |
-| Do the earlier rules still hold? | Yes: wrong next state, zero or negative amounts and going below zero are refused. |
-| Do the checks notice a weakened rule? | Yes: pointing the rule at output #0, or removing it from `add`, fails checks. |
+| Must the covenant input or output be first? | No. With an ordinary input first and the covenant input second, an honest move passes and a leak is refused. |
+| Do the earlier rules still hold? | Yes: wrong next state, zero or negative amounts in either transition, and going below zero are refused. |
+| Do the checks notice a weakened rule? | Yes: `tools/mutation_check.py` tries 15 weakenings of this contract — removing a rule, reading input #0 or output #0 instead, allowing one sompi less — and each one fails checks. |
 
 ### Why not simply check output #0
 
@@ -142,8 +152,7 @@ only, as an example of what not to do. It stops the simple leak, but:
 The guide's live Counter example pays every fee out of the Counter's own
 coin, so the coin shrinks with each move; it relies on the amount being
 unchecked. With the keeping rule the fee has to come from a separate input.
-In simulation such a transaction passes. Building and submitting one on a
-network was not tried here.
+In simulation such a transaction passes; step 4 submits it to testnet.
 
 KeepingCounter still checks no signature. It keeps the coins inside the
 covenant; it does not decide who may move the count.
@@ -230,10 +239,19 @@ require(checkSig(owner_sig, owner));
 the contract template, so it cannot change while the covenant lives. The
 signature travels as an extra argument of the transition.
 
-Offline checks: `tests/test_counter_owned.py` (9). Offline only the refusing
-side can be checked — a transition without a valid owner signature is refused
-at the signature line, before any other rule is looked at. A valid signature
-commits to a real transaction, so the accepting side was checked on testnet:
+Offline checks: `tests/test_counter_owned.py` (25). A signature commits to a
+transaction, so each check builds the same transaction the engine
+synthesizes for its scenario and signs that mirror with a throwaway key.
+
+| Question | Result |
+| --- | --- |
+| Can the owner move the count? | Yes: `add`, `subtract`, down to exactly zero, with a top-up, with the fee from a separate input, with the covenant input and output not first. |
+| Can anybody else? | No: a genuine signature of another key, the owner's signature made for another transaction, a made-up or malformed signature are all refused at the signature line — before any other rule is looked at. |
+| Can the owner break the other rules? | No: one sompi less, a leak hidden behind a big first output, a leak with the covenant input not first, zero or negative amounts, going below zero and a wrong next state are refused although the owner signed them. |
+| Can the owner hand the covenant to another key? | No: a continuation into the same contract with another owner is refused. |
+| What does the signature pin down? | With the default signature type, everything: it cannot be reused for another outcome. A signature of type `None`, which does not cover the outputs, lets whoever holds it choose the move — so the owner must not sign that way. The coin rule holds even then. |
+
+The same on testnet-10:
 
 | Action on testnet-10 | Signed by | Node answer |
 | --- | --- | --- |
@@ -256,8 +274,18 @@ exercise with test coins and wrong for anything else.
   On testnet-10 there was one run of each scenario for the guide's Counter,
   KeepingCounter and OwnedCounter, through public nodes. Guard and
   StrictCounter were never put on chain.
-- **No independent review.** The attacks tried here are the ones the author
-  of the checks thought of.
+- **One adversarial pass, not an audit.** On 2026-10-06 the contracts and the
+  offline checks went through a separate pass whose only job was to break
+  them: scripted attacks and a random search over transactions with up to
+  three inputs and four outputs against KeepingCounter (re-run here with 3000
+  random transactions: none broke a rule). It found no transaction that takes coins out, moves the
+  count against the rules or moves OwnedCounter without the owner. It did
+  find weak spots in the checks and wrong statements in this file, which were
+  then fixed. That is not a professional audit.
+- **The local engine has its own behaviour.** It validates only the input
+  being debugged, assumes the active input when an output does not name its
+  authorizing input, and reports some failures at a line that did not cause
+  them. The checks are written around these three things.
 - **The tooling is marked experimental upstream.** The SDK guide warns that
   the language, the compiler output and the bindings may change, and calls
   covenants the newest and least-settled part.
@@ -304,4 +332,4 @@ python -m venv .venv
 
 - An exit: a rule that lets the owner close the covenant and take the coins
   back, and nobody else.
-- A review by someone other than the author of the checks.
+- A proper review before anything here is reused for more than learning.

@@ -16,6 +16,13 @@ import unittest
 from pathlib import Path
 
 import kaspa.experimental.silverscript as silverscript
+from kaspa import (
+    Hash,
+    TransactionOutpoint,
+    TransactionOutput,
+    covenant_id,
+    pay_to_script_hash_script,
+)
 
 CONTRACTS = Path(__file__).resolve().parent.parent / "contracts"
 COUNTER = (CONTRACTS / "counter.sil").read_text(encoding="utf-8")
@@ -23,7 +30,21 @@ STRICT = (CONTRACTS / "counter_strict.sil").read_text(encoding="utf-8")
 
 COVENANT_ID = "11" * 32
 OTHER_COVENANT_ID = "22" * 32
+PREVIOUS_TX = "aa" * 32
 VALUE = 5000  # sompi carried by the synthetic covenant UTXO
+
+# A contract with a state but no covenant rules at all: the control for checks
+# that are about the transaction's structure.
+RULELESS = """pragma silverscript ^0.1.0;
+
+contract Nothing(int init_count) {
+    int count = init_count;
+
+    entry add(int amount) {
+        require(amount == amount);
+    }
+}
+"""
 
 
 def line_of(source: str, fragment: str, occurrence: int = 1) -> int:
@@ -83,8 +104,10 @@ class CounterCompilation(unittest.TestCase):
         self.assertEqual(bytes(self.at_zero.template_hash), bytes(self.at_five.template_hash))
 
     def test_transitions_are_called_through_the_covenant_builder(self):
-        call = self.at_zero.build_sig_script_for_covenant_decl("add", [5])
-        self.assertEqual(call, self.at_zero.build_sig_script_for_covenant_decl("add", [5]))
+        add = self.at_zero.build_sig_script_for_covenant_decl("add", [5])
+        subtract = self.at_zero.build_sig_script_for_covenant_decl("subtract", [5])
+        self.assertTrue(add)
+        self.assertNotEqual(add, subtract)  # each transition has its own entrypoint
         with self.assertRaises(silverscript.SilverScriptError):
             self.at_zero.build_sig_script("add", [5])
 
@@ -112,17 +135,63 @@ class CounterTransitions(unittest.TestCase):
 
     def test_count_cannot_overflow_a_64_bit_integer(self):
         top = 2**63 - 1
-        self.assertFalse(transition(COUNTER, "add", top, 1, [covenant_output(top)]).success)
+        result = transition(COUNTER, "add", top, 1, [covenant_output(top)])
+        self.assertFalse(result.success)
+        self.assertIn("64-bit", str(result.error))
 
 
 class CounterStructure(unittest.TestCase):
-    """The transition must continue the same covenant in exactly one output."""
+    """The transition must continue the same covenant in exactly one output.
 
-    def test_output_bound_to_another_covenant_is_refused(self):
+    A covenant id cannot be made up: the engine rejects a transaction whose
+    ids do not add up before any contract code runs. So the checks about
+    "another covenant" use a correctly derived id of a brand-new covenant,
+    and a contract with no covenant rules as a control: if the control passes
+    and the Counter does not, it is the Counter's own rule that refused.
+    """
+
+    def new_covenant_scenario(self, source, with_covenant_input):
+        """Input: the Counter at 10. Output: a well-formed NEW covenant at 15."""
+        script = pay_to_script_hash_script(silverscript.compile(source, [15]).bytecode)
+        new_id = str(
+            covenant_id(
+                TransactionOutpoint(Hash(PREVIOUS_TX), 0), [TransactionOutput(VALUE, script, None)]
+            )
+        )
+        spent = {"utxo_value": VALUE, "state": {"count": 10}, "prev_txid": PREVIOUS_TX, "prev_index": 0}
+        if with_covenant_input:
+            spent["covenant_id"] = COVENANT_ID
+        return {
+            "inputs": [spent],
+            "outputs": [
+                {"value": VALUE, "covenant_id": new_id, "authorizing_input": 0, "state": {"count": 15}}
+            ],
+        }
+
+    def run_add(self, source, scenario):
+        return silverscript.debug_call(source, "add", args=[5], constructor_args=[0], tx=scenario)
+
+    def test_output_that_starts_another_covenant_is_refused_by_the_contract(self):
+        control = self.run_add(RULELESS, self.new_covenant_scenario(RULELESS, True))
+        counter = self.run_add(COUNTER, self.new_covenant_scenario(COUNTER, True))
+        self.assertTrue(control.success)
+        self.assertFalse(counter.success)
+        self.assertIsNotNone(counter.failure)  # refused by the script, not by the engine's id check
+
+    def test_input_without_a_covenant_id_is_refused_by_the_contract(self):
+        control = self.run_add(RULELESS, self.new_covenant_scenario(RULELESS, False))
+        counter = self.run_add(COUNTER, self.new_covenant_scenario(COUNTER, False))
+        self.assertTrue(control.success)
+        self.assertFalse(counter.success)
+        self.assertIsNotNone(counter.failure)
+
+    def test_made_up_covenant_id_is_rejected_before_the_contract_runs(self):
         result = transition(
             COUNTER, "add", 10, 5, [covenant_output(15, covenant_id=OTHER_COVENANT_ID)]
         )
         self.assertFalse(result.success)
+        self.assertIsNone(result.failure)
+        self.assertIn("Covenant structure error", str(result.error))
 
     def test_output_without_a_covenant_binding_is_refused(self):
         plain = {"value": VALUE, "state": {"count": 15}}
@@ -134,11 +203,6 @@ class CounterStructure(unittest.TestCase):
 
     def test_no_output_at_all_is_refused(self):
         self.assertFalse(transition(COUNTER, "add", 10, 5, []).success)
-
-    def test_input_without_a_covenant_id_is_refused(self):
-        bare_input = [{"utxo_value": VALUE, "state": {"count": 10}}]
-        result = transition(COUNTER, "add", 10, 5, [covenant_output(15)], inputs=bare_input)
-        self.assertFalse(result.success)
 
     def test_unknown_state_field_is_a_usage_error(self):
         wrong = dict(covenant_output(15), state={"total": 15})

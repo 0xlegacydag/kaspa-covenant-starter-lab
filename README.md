@@ -6,10 +6,10 @@ A small learning exercise on native Kaspa L1 scripts written in
 **Status: work in progress. Educational, unaudited, not for real funds.**
 
 Steps 1–3 run offline on one computer: no network, no wallet, no coins, no
-token, no deployment. Step 4 was run once on testnet-10 with test coins only.
-Nothing here ever touched mainnet.
+token, no deployment. Steps 4 and 5 were also run on testnet-10, with test
+coins only. Nothing here ever touched mainnet.
 
-Last successful run of the offline checks: 2026-10-06, 66 checks, all passing.
+Last successful run of the offline checks: 2026-10-06, 81 checks, all passing.
 
 ## Step 1 — Guard: a rule that is checked once
 
@@ -165,9 +165,11 @@ refuses anything else. The key is a throwaway made by `testnet/make_key.py`,
 kept in a file outside the repository and never printed.
 
 Offline checks for how these transactions are assembled:
-`tests/test_testnet_builder.py` (11) — who pays the fee, what the covenant
-output carries, which input is signed. Read-only access to testnet-10 through
-the public node resolver was confirmed on 2026-10-06 (node version 2.1.0).
+`tests/test_testnet_builder.py` (17) — who pays the fee, what the covenant
+output carries, which input is signed, how the owner's signature gets into
+the call. The program reaches testnet-10 through the SDK's public node
+resolver (node version 2.1.0 on 2026-10-06). `--contract` selects which of
+the four Counter contracts it works with.
 
 ### Run of 2026-10-06
 
@@ -188,16 +190,74 @@ accepted transactions.
 
 The node gives the same message for all three refusals — "script ran, but
 verification failed" — so it confirms *that* they are refused, not *which*
-rule refused them. That attribution comes from the local engine in step 3.
-One run, one node; no control run against a Counter without the value rule.
+rule refused them. That attribution comes from the local engine in step 3
+and from the control run below.
+
+### Control run: the guide's Counter on testnet
+
+Full record: `results/testnet-variants-2026-10-06.md`.
+
+The same program, pointed at `contracts/counter.sil` instead:
+
+| Action | Node answer |
+| --- | --- |
+| `try leak` — only 1 of 2 test KAS stays in the covenant | **accepted**: 1 test KAS left the covenant |
+| `try negative` — `add(-20)` | **accepted**: the count went from 5 to -15 |
+
+Both transactions that KeepingCounter refuses are accepted by the guide's
+Counter. The gaps found offline in step 2 are real on a node, and it is the
+contract's rules that make the difference.
+
+### Anyone can move it; one coin, one move
+
+- A second test key, which had nothing to do with creating the covenant,
+  moved KeepingCounter (`add 1`, accepted). The coins stayed inside.
+- Two different moves spending the same covenant UTXO, each paid by a
+  different key, were submitted one after the other: the first was accepted,
+  the second refused with "already spent by transaction … in the mempool".
+  The state lives in one coin, so only one move per coin can win.
+
+## Step 5 — OwnedCounter: who may move
+
+`contracts/counter_owned.sil` is KeepingCounter plus one rule at the top of
+every transition:
+
+```
+require(checkSig(owner_sig, owner));
+```
+
+`owner` is a public key given when the contract is created. It is part of
+the contract template, so it cannot change while the covenant lives. The
+signature travels as an extra argument of the transition.
+
+Offline checks: `tests/test_counter_owned.py` (9). Offline only the refusing
+side can be checked — a transition without a valid owner signature is refused
+at the signature line, before any other rule is looked at. A valid signature
+commits to a real transaction, so the accepting side was checked on testnet:
+
+| Action on testnet-10 | Signed by | Node answer |
+| --- | --- | --- |
+| `move add 5`, `move subtract 2` | owner | accepted |
+| `try leak` — only 1 of 2 test KAS stays | owner | refused |
+| `try negative` — `add(-20)` | owner | refused |
+| `move add 1` | another key | refused |
+
+The owner's signature makes a move possible; it does not switch the other
+rules off. Full record: `results/testnet-variants-2026-10-06.md`.
+
+**No exit.** Neither KeepingCounter nor OwnedCounter has a way to take the
+coins out again: whatever is locked in them stays locked. That is fine for an
+exercise with test coins and wrong for anything else.
 
 ## What none of this shows
 
 - **Simulation is not network validation.** In steps 1–3 calls are executed
   by the local SilverScript debug engine against a synthetic transaction.
-  Only step 4 talked to a network, and only for KeepingCounter: one run on
-  testnet-10. Guard, the guide's Counter and StrictCounter were never put on
-  chain.
+  On testnet-10 there was one run of each scenario for the guide's Counter,
+  KeepingCounter and OwnedCounter, through public nodes. Guard and
+  StrictCounter were never put on chain.
+- **No independent review.** The attacks tried here are the ones the author
+  of the checks thought of.
 - **The tooling is marked experimental upstream.** The SDK guide warns that
   the language, the compiler output and the bindings may change, and calls
   covenants the newest and least-settled part.
@@ -233,11 +293,15 @@ python -m venv .venv
 - `contracts/counter.sil` — the Counter from the
   [same guide](https://github.com/kaspanet/kaspa-python-sdk/blob/v2.1.0/docs/learn/silverscript/covenants.md)
   (ISC license).
-- `contracts/counter_strict.sil`, `contracts/counter_keeping.sil`, the tests
-  and the walkthrough scripts — written for this exercise.
+- `contracts/counter_strict.sil`, `contracts/counter_keeping.sil`,
+  `contracts/counter_owned.sil`, the tests, the walkthrough scripts and the
+  testnet program — written for this exercise. The way transactions are
+  assembled follows the SDK's
+  [Counter example](https://github.com/kaspanet/kaspa-python-sdk/blob/v2.1.0/examples/silverscript/counter.py)
+  (ISC license).
 
 ## Next
 
-- A control run on testnet: the same leak against a Counter without the value
-  rule, to see the difference on chain and not only in the local engine.
-- Deciding who may move the count: a signature check on the transitions.
+- An exit: a rule that lets the owner close the covenant and take the coins
+  back, and nobody else.
+- A review by someone other than the author of the checks.

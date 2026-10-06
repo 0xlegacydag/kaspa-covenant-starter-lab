@@ -60,7 +60,9 @@ Last successful run: 2026-10-06, 14 checks, all passing
 - `kaspa==2.1.0` from PyPI, hashes pinned in `requirements.txt` (the wheel is
   byte-identical to the asset of the
   [v2.1.0 release](https://github.com/kaspanet/kaspa-python-sdk/releases/tag/v2.1.0))
-- The bundled SilverScript compiler reports version `0.1.0`
+- SDK 2.1.0 builds its SilverScript bindings from the SilverScript `v1.0.0`
+  tag (commit `3ed9733`); the compiler reports language version `0.1.0`,
+  the one the `pragma` line asks for
 - No other dependencies; tests use the standard library
 
 ## Run

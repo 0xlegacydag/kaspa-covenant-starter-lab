@@ -35,3 +35,27 @@ error: script ran, but verification failed
    count  10, add(  0), claims  10 -> refused
    count  10, subtract( -5), claims  15 -> refused
    only 1000 of 5000 sompi stay in the covenant           -> passes
+
+7. KeepingCounter: the covenant output must carry at least the coins being spent
+   all 5000 sompi stay                          -> passes
+   one sompi less stays                         -> refused
+   1000 stay, 4000 leave                        -> refused
+   1000 stay, hidden behind a big first output  -> refused
+   fee paid from a separate input               -> passes
+
+8. Why a leak is refused
+error: script ran, but verification failed
+   --> 10:9
+   |
+ 9 |         int out_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
+10 |         require(tx.outputs[out_idx].value >= tx.inputs[this.activeInputIndex].value);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ verification failed here
+   |   amount = 5, count = 10, init_count = 0, out_idx = 0, prev_state = {count: 10}
+   |
+   ::: called from add
+   |
+ 1 | pragma silverscript ^0.1.0;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ in this call
+   |   amount = 5, count = 10, init_count = 0, prev_state = {count: 10}
+   |
+

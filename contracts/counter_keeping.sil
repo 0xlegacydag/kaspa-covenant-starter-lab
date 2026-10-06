@@ -1,0 +1,22 @@
+pragma silverscript ^0.1.0;
+
+contract KeepingCounter(int init_count) {
+    int count = init_count;
+
+    #[covenant(binding = auth, from = 1, to = 1, mode = transition)]
+    function add(State prev_state, int amount) : (State) {
+        require(amount > 0);
+        int out_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
+        require(tx.outputs[out_idx].value >= tx.inputs[this.activeInputIndex].value);
+        return(State { count: prev_state.count + amount });
+    }
+
+    #[covenant(binding = auth, from = 1, to = 1, mode = transition)]
+    function subtract(State prev_state, int amount) : (State) {
+        require(amount > 0);
+        require(prev_state.count - amount >= 0);
+        int out_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
+        require(tx.outputs[out_idx].value >= tx.inputs[this.activeInputIndex].value);
+        return(State { count: prev_state.count - amount });
+    }
+}

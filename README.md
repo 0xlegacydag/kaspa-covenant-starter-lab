@@ -8,7 +8,7 @@ A small learning exercise on native Kaspa L1 scripts written in
 Everything here runs offline on one computer. No network, no wallet, no
 coins (not even testnet ones), no token, no deployment.
 
-Last successful run: 2026-10-06, 40 checks, all passing.
+Last successful run: 2026-10-06, 55 checks, all passing.
 
 ## Step 1 — Guard: a rule that is checked once
 
@@ -83,7 +83,7 @@ are kept as checks so the behaviour is on record.
 2. **The amount of coins.** The contract checks the next *state*, not how
    many coins move into it. A transition that keeps 1000 of 5000 sompi in the
    covenant and sends the rest elsewhere passes. The Counter also checks no
-   signature, so anyone may make a transition.
+   signature, so anyone may make a transition. (Closed in step 3.)
 
 ### Own variant: StrictCounter
 
@@ -92,9 +92,60 @@ are kept as checks so the behaviour is on record.
 refused at the new line, while ordinary transitions behave as before.
 
 It does **not** close the second gap: the coin amount is still unchecked.
-Doing that properly needs a rule that ties the value of the covenant output
-to the value of the input being spent, and that is the next thing to learn
-here.
+That is step 3.
+
+## Step 3 — KeepingCounter: a covenant that keeps its coins
+
+`contracts/counter_keeping.sil` is the strict Counter plus one more rule in
+each transition:
+
+```
+int out_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
+require(tx.outputs[out_idx].value >= tx.inputs[this.activeInputIndex].value);
+```
+
+The output that continues the covenant must carry at least as many sompi as
+the input being spent. That output is found through the covenant machinery —
+the same lookup the compiler-generated wrapper uses to validate the next
+state (see SilverScript's
+[covenant declarations](https://github.com/kaspanet/silverscript/blob/v1.0.0/docs/DECL.md))
+— not by a fixed position in the transaction.
+
+Checks: `tests/test_counter_value.py` (15). The walkthrough output is in
+`results/counter-walkthrough.txt`, sections 7 and 8.
+
+| Question | Result |
+| --- | --- |
+| Does a transition that keeps every coin pass? | Yes, for `add` and `subtract`. |
+| Is losing a single sompi refused? | Yes, at the value rule. |
+| Is the leak from step 2 refused? | Yes: 1000 of 5000 staying is refused, whichever order the outputs are in. |
+| Can the leak hide behind a big first output? | No: refused. |
+| Can the fee come from somewhere else? | Yes: with a separate input covering it, the covenant keeps all 5000 and the transition passes. |
+| Can coins be added to the covenant? | Yes: a top-up from a separate input passes. |
+| Must the covenant output be first? | No. |
+| Do the earlier rules still hold? | Yes: wrong next state, zero or negative amounts and going below zero are refused. |
+| Do the checks notice a weakened rule? | Yes: pointing the rule at output #0, or removing it from `add`, fails checks. |
+
+### Why not simply check output #0
+
+A naive version of the rule looks at `tx.outputs[0]`. It lives in the tests
+only, as an example of what not to do. It stops the simple leak, but:
+
+- the spender can add an input of their own, put a large plain output first
+  and leave 1000 sompi in the covenant — the naive rule passes, and 4000 of
+  the covenant's coins walk away;
+- it refuses an honest transition whose covenant output is not first.
+
+### What changes on a real network
+
+The guide's live Counter example pays every fee out of the Counter's own
+coin, so the coin shrinks with each move; it relies on the amount being
+unchecked. With the keeping rule the fee has to come from a separate input.
+In simulation such a transaction passes. Building and submitting one on a
+network was not tried here.
+
+KeepingCounter still checks no signature. It keeps the coins inside the
+covenant; it does not decide who may move the count.
 
 ## What none of this shows
 
@@ -137,13 +188,11 @@ python -m venv .venv
 - `contracts/counter.sil` — the Counter from the
   [same guide](https://github.com/kaspanet/kaspa-python-sdk/blob/v2.1.0/docs/learn/silverscript/covenants.md)
   (ISC license).
-- `contracts/counter_strict.sil`, the tests and the walkthrough scripts —
-  written for this exercise.
+- `contracts/counter_strict.sil`, `contracts/counter_keeping.sil`, the tests
+  and the walkthrough scripts — written for this exercise.
 
 ## Next
 
-1. A covenant that keeps its coins: tie the value of the next covenant output
-   to the value being spent, and check that a transition which leaks coins is
-   refused.
-2. After that, as a separate exercise: the Counter on testnet with test coins
-   only.
+As a separate exercise: KeepingCounter on testnet with test coins only —
+creating the covenant, paying fees from a separate input, and seeing whether
+a node accepts and refuses the same transitions the local engine does.

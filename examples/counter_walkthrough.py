@@ -16,6 +16,7 @@ import kaspa.experimental.silverscript as silverscript
 ROOT = Path(__file__).resolve().parent.parent
 COUNTER = (ROOT / "contracts" / "counter.sil").read_text(encoding="utf-8")
 STRICT = (ROOT / "contracts" / "counter_strict.sil").read_text(encoding="utf-8")
+KEEPING = (ROOT / "contracts" / "counter_keeping.sil").read_text(encoding="utf-8")
 
 COVENANT_ID = "11" * 32
 VALUE = 5000
@@ -91,6 +92,38 @@ def main() -> None:
     leak = transition(STRICT, "add", 10, 5, [covenant_output(15, value=1000), {"value": 4000}])
     verdict = "passes" if leak.success else "refused"
     print(f"   only 1000 of {VALUE} sompi stay in the covenant           -> {verdict}")
+
+    print()
+    print("7. KeepingCounter: the covenant output must carry at least the coins being spent")
+    covenant_in = {"utxo_value": VALUE, "covenant_id": COVENANT_ID, "state": {"count": 10}}
+    scenarios = [
+        ("all 5000 sompi stay", [covenant_in], [covenant_output(15)]),
+        ("one sompi less stays", [covenant_in], [covenant_output(15, value=VALUE - 1)]),
+        ("1000 stay, 4000 leave", [covenant_in], [covenant_output(15, value=1000), {"value": 4000}]),
+        (
+            "1000 stay, hidden behind a big first output",
+            [covenant_in, {"utxo_value": 5000}],
+            [{"value": 9000}, covenant_output(15, value=1000)],
+        ),
+        ("fee paid from a separate input", [covenant_in, {"utxo_value": 300}], [covenant_output(15)]),
+    ]
+    for label, inputs, outputs in scenarios:
+        result = silverscript.debug_call(
+            KEEPING, "add", args=[5], constructor_args=[0], tx={"inputs": inputs, "outputs": outputs}
+        )
+        verdict = "passes" if result.success else "refused"
+        print(f"   {label:<44} -> {verdict}")
+
+    print()
+    print("8. Why a leak is refused")
+    result = silverscript.debug_call(
+        KEEPING,
+        "add",
+        args=[5],
+        constructor_args=[0],
+        tx={"inputs": [covenant_in], "outputs": [covenant_output(15, value=1000), {"value": 4000}]},
+    )
+    print(str(result.failure))
 
 
 if __name__ == "__main__":

@@ -5,10 +5,11 @@ A small learning exercise on native Kaspa L1 scripts written in
 
 **Status: work in progress. Educational, unaudited, not for real funds.**
 
-Everything here runs offline on one computer. No network, no wallet, no
-coins (not even testnet ones), no token, no deployment.
+Steps 1–3 run offline on one computer: no network, no wallet, no coins, no
+token, no deployment. Step 4 is prepared for testnet-10 with test coins only
+and has not been run yet.
 
-Last successful run: 2026-10-06, 55 checks, all passing.
+Last successful run of the offline checks: 2026-10-06, 66 checks, all passing.
 
 ## Step 1 — Guard: a rule that is checked once
 
@@ -147,6 +148,30 @@ network was not tried here.
 KeepingCounter still checks no signature. It keeps the coins inside the
 covenant; it does not decide who may move the count.
 
+## Step 4 — KeepingCounter on testnet-10 (prepared, not run yet)
+
+`testnet/counter_live.py` is meant to repeat step 3 against real nodes:
+
+1. `genesis` — lock 2 test KAS into the covenant at count 0;
+2. `move add 5`, `move subtract 3` — honest transitions, each with two
+   inputs (the covenant UTXO and a funding UTXO that pays the fee) and two
+   outputs (the next covenant UTXO with the same amount, and the change);
+3. `try leak`, `try wrong-state`, `try negative` — transactions that break a
+   rule on purpose, to see whether a node refuses what the local engine
+   refuses.
+
+It talks to testnet-10 only: it checks the network the node reports and
+refuses anything else. The key is a throwaway made by `testnet/make_key.py`,
+kept in a file outside the repository and never printed.
+
+Offline checks for how these transactions are assembled:
+`tests/test_testnet_builder.py` (11) — who pays the fee, what the covenant
+output carries, which input is signed. Read-only access to testnet-10 through
+the public node resolver was confirmed on 2026-10-06 (node version 2.1.0).
+
+**Nothing has been submitted to the network yet.** Results will be added
+here with transaction ids once the run is done.
+
 ## What none of this shows
 
 - **Simulation is not network validation.** Calls are executed by the local
@@ -193,6 +218,5 @@ python -m venv .venv
 
 ## Next
 
-As a separate exercise: KeepingCounter on testnet with test coins only —
-creating the covenant, paying fees from a separate input, and seeing whether
-a node accepts and refuses the same transitions the local engine does.
+Run step 4: create the covenant on testnet-10, make the honest transitions,
+try the rule-breaking ones, and record what the nodes answer.

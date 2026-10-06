@@ -6,8 +6,8 @@ A small learning exercise on native Kaspa L1 scripts written in
 **Status: work in progress. Educational, unaudited, not for real funds.**
 
 Steps 1–3 run offline on one computer: no network, no wallet, no coins, no
-token, no deployment. Step 4 is prepared for testnet-10 with test coins only
-and has not been run yet.
+token, no deployment. Step 4 was run once on testnet-10 with test coins only.
+Nothing here ever touched mainnet.
 
 Last successful run of the offline checks: 2026-10-06, 66 checks, all passing.
 
@@ -148,9 +148,9 @@ network was not tried here.
 KeepingCounter still checks no signature. It keeps the coins inside the
 covenant; it does not decide who may move the count.
 
-## Step 4 — KeepingCounter on testnet-10 (prepared, not run yet)
+## Step 4 — KeepingCounter on testnet-10
 
-`testnet/counter_live.py` is meant to repeat step 3 against real nodes:
+`testnet/counter_live.py` repeats step 3 against real nodes:
 
 1. `genesis` — lock 2 test KAS into the covenant at count 0;
 2. `move add 5`, `move subtract 3` — honest transitions, each with two
@@ -169,15 +169,35 @@ Offline checks for how these transactions are assembled:
 output carries, which input is signed. Read-only access to testnet-10 through
 the public node resolver was confirmed on 2026-10-06 (node version 2.1.0).
 
-**Nothing has been submitted to the network yet.** Results will be added
-here with transaction ids once the run is done.
+### Run of 2026-10-06
+
+Full record with transaction ids: `results/testnet-run-2026-10-06.md`.
+
+| Action | Node answer |
+| --- | --- |
+| `genesis` — 2 test KAS locked at count 0 | accepted |
+| `move add 5` — count 0 -> 5 | accepted |
+| `move subtract 3` — count 5 -> 2 | accepted |
+| `try leak` — only 1 of 2 test KAS stays in the covenant | refused |
+| `try wrong-state` — output claims a count the rules do not produce | refused |
+| `try negative` — `add(-20)` | refused |
+
+The covenant held exactly 2 test KAS after every accepted move; all fees came
+from the separate funding input. A public testnet explorer confirms the three
+accepted transactions.
+
+The node gives the same message for all three refusals — "script ran, but
+verification failed" — so it confirms *that* they are refused, not *which*
+rule refused them. That attribution comes from the local engine in step 3.
+One run, one node; no control run against a Counter without the value rule.
 
 ## What none of this shows
 
-- **Simulation is not network validation.** Calls are executed by the local
-  SilverScript debug engine against a synthetic transaction. Nothing was
-  submitted to any network. Creating a covenant on chain, its covenant id,
-  fees, mass and acceptance by a node were not tested.
+- **Simulation is not network validation.** In steps 1–3 calls are executed
+  by the local SilverScript debug engine against a synthetic transaction.
+  Only step 4 talked to a network, and only for KeepingCounter: one run on
+  testnet-10. Guard, the guide's Counter and StrictCounter were never put on
+  chain.
 - **The tooling is marked experimental upstream.** The SDK guide warns that
   the language, the compiler output and the bindings may change, and calls
   covenants the newest and least-settled part.
@@ -218,5 +238,6 @@ python -m venv .venv
 
 ## Next
 
-Run step 4: create the covenant on testnet-10, make the honest transitions,
-try the rule-breaking ones, and record what the nodes answer.
+- A control run on testnet: the same leak against a Counter without the value
+  rule, to see the difference on chain and not only in the local engine.
+- Deciding who may move the count: a signature check on the transitions.

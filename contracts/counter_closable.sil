@@ -1,0 +1,39 @@
+pragma silverscript ^0.1.0;
+
+contract ClosableCounter(int init_count, pubkey owner) {
+    int count = init_count;
+
+    function onlyOwner(sig owner_sig) {
+        require(checkSig(owner_sig, owner));
+        require(owner_sig.slice(64, 65) == byte[](0x01));
+    }
+
+    function keepCoins() {
+        int out_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
+        require(tx.outputs[out_idx].value >= tx.inputs[this.activeInputIndex].value);
+    }
+
+    #[covenant(binding = auth, from = 1, to = 1, mode = transition)]
+    function add(State prev_state, int amount, sig owner_sig) : (State) {
+        onlyOwner(owner_sig);
+        require(amount > 0);
+        keepCoins();
+        return(State { count: prev_state.count + amount });
+    }
+
+    #[covenant(binding = auth, from = 1, to = 1, mode = transition)]
+    function subtract(State prev_state, int amount, sig owner_sig) : (State) {
+        onlyOwner(owner_sig);
+        require(amount > 0);
+        require(prev_state.count - amount >= 0);
+        keepCoins();
+        return(State { count: prev_state.count - amount });
+    }
+
+    #[covenant.singleton(mode = transition, termination = allowed)]
+    function close(State prev_state, State[] next_states, sig owner_sig) : (State[]) {
+        onlyOwner(owner_sig);
+        require(next_states.length == 0);
+        return(next_states);
+    }
+}

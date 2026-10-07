@@ -31,7 +31,8 @@ def require_line() -> int:
     for number, line in enumerate(SOURCE.splitlines(), start=1):
         if "require(" in line:
             return number
-    raise AssertionError("no require statement in the contract source")
+    # Not a failed assertion: a rule line that is missing says nothing about behaviour.
+    raise LookupError("no require statement in the contract source")
 
 
 def simulate(amount: int):

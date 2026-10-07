@@ -66,7 +66,8 @@ def line_of(source: str, fragment: str, occurrence: int = 1) -> int:
             seen += 1
             if seen == occurrence:
                 return number
-    raise AssertionError(f"{fragment!r} (occurrence {occurrence}) not found")
+    # Not a failed assertion: a rule line that is missing says nothing about behaviour.
+    raise LookupError(f"{fragment!r} (occurrence {occurrence}) not found in the contract source")
 
 
 def lock(count: int, owner: bytes = OWNER):
@@ -98,20 +99,24 @@ def render(
     covenant_input_first=True,
     plain_out=None,
     plain_output_first=False,
+    value_in=VALUE,
+    second_plain_out=None,
 ):
     """One transaction, described once and rendered twice.
 
     Returns (scenario, mirror): the scenario the debug engine runs, and the
     same transaction as a `kaspa.Transaction`, so that it can be signed.
     Optional extras: one ordinary input (`plain_in` sompi) and one ordinary
-    output (`plain_out` sompi), each before or after the covenant one.
+    output (`plain_out` sompi), each before or after the covenant one; a second
+    ordinary output (`second_plain_out` sompi) goes last. The covenant coin
+    holds `value_in` sompi.
     """
     active = 0 if (plain_in is None or covenant_input_first) else 1
     plain_script_bytes = bytes.fromhex(PLAIN_SCRIPT.script)
     binding = CovenantBinding(authorizing_input=active, covenant_id=Hash(COVENANT_ID))
 
     covenant_in = {
-        "utxo_value": VALUE,
+        "utxo_value": value_in,
         "covenant_id": COVENANT_ID,
         "state": {"count": previous},
         "prev_txid": PREVIOUS_TX,
@@ -133,7 +138,7 @@ def render(
             sequence=0,
             sig_op_count=0,
             compute_budget=0,
-            utxo=utxo(PREVIOUS_TX, VALUE, lock(previous), COVENANT_ID),
+            utxo=utxo(PREVIOUS_TX, value_in, lock(previous), COVENANT_ID),
         )
     ]
     scenario_outputs = [covenant_out]
@@ -165,6 +170,9 @@ def render(
         position = 0 if plain_output_first else len(scenario_outputs)
         scenario_outputs.insert(position, {"value": plain_out, "script": plain_script_bytes})
         mirror_outputs.insert(position, TransactionOutput(plain_out, PLAIN_SCRIPT, None))
+    if second_plain_out is not None:
+        scenario_outputs.append({"value": second_plain_out, "script": plain_script_bytes})
+        mirror_outputs.append(TransactionOutput(second_plain_out, PLAIN_SCRIPT, None))
 
     scenario = {"inputs": scenario_inputs, "outputs": scenario_outputs}
     if active:
@@ -322,6 +330,25 @@ class OwnerCannotBreakTheOtherRules(unittest.TestCase):
                 self.assertTrue(signed_call(function, amount, 10, count, VALUE, **honest).success)
                 self.assertFalse(signed_call(function, amount, 10, count, 1, **shape).success)
 
+    def test_owner_cannot_split_a_leak_over_two_plain_outputs(self):
+        # No other scenario has three outputs.
+        honest = dict(plain_in=500, plain_out=100, second_plain_out=100)
+        for function, amount, count in MOVES:
+            with self.subTest(function=function):
+                self.assertTrue(signed_call(function, amount, 10, count, VALUE, **honest).success)
+                leak = signed_call(function, amount, 10, count, 1000, plain_out=2000, second_plain_out=2000)
+                self.assertFalse(leak.success)
+
+    def test_the_coin_rule_follows_the_coin_being_spent_not_a_fixed_amount(self):
+        # Every other scenario spends a 5000-sompi coin: a rule comparing with the number 5000 would pass them all.
+        for function, amount, count in MOVES:
+            with self.subTest(function=function):
+                leak = signed_call(function, amount, 10, count, VALUE, value_in=9000, plain_out=4000)
+                self.assertFalse(leak.success)
+                self.assertFalse(signed_call(function, amount, 10, count, 8999, value_in=9000).success)
+                self.assertTrue(signed_call(function, amount, 10, count, 9000, value_in=9000).success)
+                self.assertTrue(signed_call(function, amount, 10, count, 3000, value_in=3000).success)
+
     def test_owner_cannot_add_zero_or_a_negative_amount(self):
         for amount, claimed in ((0, 10), (-20, -10)):
             with self.subTest(amount=amount):
@@ -359,6 +386,13 @@ class SignatureScope(unittest.TestCase):
         for_fifteen = sign(10, 15, VALUE)
         self.assertTrue(call("add", 5, for_fifteen, claimed=15).success)
         self.assertFalse(call("add", 6, for_fifteen, claimed=16).success)
+
+    def test_all_six_signature_types_are_accepted(self):
+        # OwnedCounter does not restrict the type; ClosableCounter does.
+        for name in ("All", "None", "Single", "AllAnyOneCanPay", "NoneAnyOneCanPay", "SingleAnyOneCanPay"):
+            with self.subTest(sighash=name):
+                signature = sign(10, 15, VALUE, sighash=getattr(SighashType, name))
+                self.assertTrue(call("add", 5, signature, claimed=15).success)
 
     def test_sighash_none_signature_does_not_pin_the_next_count(self):
         # Recorded as observed behaviour: a signature that does not cover the outputs

@@ -9,7 +9,8 @@ spent. The output is located through the covenant machinery
 How a refusal is attributed to the value rule. The line number in the
 engine's report is not enough: a failure in the compiler-generated checks
 (wrong next state, not exactly one covenant output) is reported at the last
-statement of the function, which here is the value rule. So every "refused
+statement of the move, which in this contract is the value rule (in other
+contracts it is reported at other lines). So every "refused
 because of the coins" check below is a comparison: the very same transaction
 is accepted by StrictCounter, which differs from KeepingCounter only by the
 value rule.
@@ -60,7 +61,8 @@ def line_of(source: str, fragment: str, occurrence: int = 1) -> int:
             seen += 1
             if seen == occurrence:
                 return number
-    raise AssertionError(f"{fragment!r} (occurrence {occurrence}) not found")
+    # Not a failed assertion: a rule line that is missing says nothing about behaviour.
+    raise LookupError(f"{fragment!r} (occurrence {occurrence}) not found in the contract source")
 
 
 def covenant_input(count: int, value: int = VALUE) -> dict:
@@ -111,6 +113,13 @@ def leak_plain_first(count):
     return [covenant_input(10)], [plain_output(4000), covenant_output(count, 1000)]
 
 
+def leak_split_over_two_plain_outputs(count):
+    return (
+        [covenant_input(10)],
+        [covenant_output(count, 1000), plain_output(2000), plain_output(2000)],
+    )
+
+
 def leak_behind_a_big_first_output(count):
     # The spender adds 5000 sompi of their own, puts a 9000 plain output first and
     # leaves only 1000 in the covenant: 4000 of the covenant's coins walk away.
@@ -135,7 +144,7 @@ def covenant_output_second(count):
     )
 
 
-LEAKS = (one_sompi_less, leak, leak_plain_first, leak_behind_a_big_first_output)
+LEAKS = (one_sompi_less, leak, leak_plain_first, leak_split_over_two_plain_outputs, leak_behind_a_big_first_output)
 HONEST = (same_value, fee_from_another_input, top_up, covenant_output_second)
 MOVES = (("add", 5, 15), ("subtract", 3, 7))
 
@@ -173,6 +182,19 @@ class KeepingCounterRefusesLeaks(unittest.TestCase):
                 with self.subTest(function=function, shape=shape.__name__):
                     self.assert_refused_because_of_the_coins(function, amount, *shape(count))
 
+    def test_the_rule_follows_the_coin_being_spent_not_a_fixed_amount(self):
+        # Every other scenario spends a 5000-sompi coin: a rule comparing with the number 5000 would pass them all.
+        for function, amount, count in MOVES:
+            with self.subTest(function=function):
+                bigger = [covenant_input(10, 9000)]
+                leaking = [covenant_output(count, VALUE), plain_output(4000)]
+                self.assert_refused_because_of_the_coins(function, amount, bigger, leaking)
+                one_less = [covenant_output(count, 8999)]
+                self.assert_refused_because_of_the_coins(function, amount, bigger, one_less)
+                self.assertTrue(call(KEEPING, function, amount, bigger, [covenant_output(count, 9000)]).success)
+                smaller = [covenant_input(10, 3000)]
+                self.assertTrue(call(KEEPING, function, amount, smaller, [covenant_output(count, 3000)]).success)
+
     def test_leak_is_refused_when_the_covenant_input_is_not_first(self):
         # A 1-sompi ordinary input first: a rule reading "input #0" would be satisfied by 1 sompi.
         for function, amount, count in MOVES:
@@ -189,6 +211,7 @@ class KeepingCounterRefusesLeaks(unittest.TestCase):
         for function, occurrence in (("add", 1), ("subtract", 2)):
             amount, count = (5, 15) if function == "add" else (3, 7)
             result = call(KEEPING, function, amount, *leak(count))
+            self.assertFalse(result.success)
             self.assertEqual(
                 result.failure.frames[0].line,
                 line_of(KEEPING, "require(tx.outputs[out_idx].value", occurrence),
@@ -202,20 +225,18 @@ class KeepingCounterKeepsTheEarlierRules(unittest.TestCase):
                 self.assertFalse(call(KEEPING, "add", 5, *same_value(claimed)).success)
 
     def test_add_refuses_zero_and_negative_amounts(self):
-        guard = line_of(KEEPING, "require(amount > 0)", occurrence=1)
         for amount, claimed in ((0, 10), (-20, -10)):
             with self.subTest(amount=amount):
                 result = call(KEEPING, "add", amount, *same_value(claimed))
                 self.assertFalse(result.success)
-                self.assertEqual(result.failure.frames[0].line, guard)
+                self.assertEqual(result.failure.frames[0].line, line_of(KEEPING, "require(amount > 0)", occurrence=1))
 
     def test_subtract_refuses_zero_and_negative_amounts(self):
-        guard = line_of(KEEPING, "require(amount > 0)", occurrence=2)
         for amount, claimed in ((0, 10), (-5, 15)):
             with self.subTest(amount=amount):
                 result = call(KEEPING, "subtract", amount, *same_value(claimed))
                 self.assertFalse(result.success)
-                self.assertEqual(result.failure.frames[0].line, guard)
+                self.assertEqual(result.failure.frames[0].line, line_of(KEEPING, "require(amount > 0)", occurrence=2))
 
     def test_subtract_below_zero_is_refused(self):
         result = call(KEEPING, "subtract", 11, *same_value(-1))

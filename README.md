@@ -5,13 +5,13 @@ A small learning exercise on native Kaspa L1 scripts written in
 
 **Status: work in progress. Educational, unaudited, not for real funds.**
 
-Steps 1–3 run offline on one computer: no network, no wallet, no coins, no
-token, no deployment. Steps 4 and 5 were also run on testnet-10, with test
+Steps 1–3 and 6 run offline on one computer: no network, no wallet, no coins,
+no token, no deployment. Steps 4 and 5 were also run on testnet-10, with test
 coins only. Nothing here ever touched mainnet.
 
-Last successful run of the offline checks: 2026-10-06, 97 checks, all passing.
+Last successful run of the offline checks: 2026-10-07, 134 checks, all passing.
 `tools/mutation_check.py` weakens one contract rule at a time and reruns them:
-all 36 weakenings were noticed.
+all 66 weakenings were noticed.
 
 ## Step 1 — Guard: a rule that is checked once
 
@@ -114,16 +114,19 @@ state (see SilverScript's
 [covenant declarations](https://github.com/kaspanet/silverscript/blob/v1.0.0/docs/DECL.md))
 — not by a fixed position in the transaction.
 
-Checks: `tests/test_counter_value.py` (14, most of them run over both
+Checks: `tests/test_counter_value.py` (15, most of them run over both
 transitions and several transaction shapes). The walkthrough output is in
 `results/counter-walkthrough.txt`, sections 7 and 8.
 
 A note on how a refusal is pinned to this rule. The engine reports a failure
 of the compiler-generated checks (wrong next state, not exactly one covenant
-output) at the last statement of the function, which here is the value rule.
-So the line number alone does not say which rule refused. The checks
-therefore compare: the very same transaction is refused by KeepingCounter
-and accepted by StrictCounter, which differs only by the value rule.
+output) at a line that did not cause it. In this contract that is the last
+statement of the move, which is the value rule; in Counter it is line 1; in
+ClosableCounter (step 6) it is a line inside a helper function or the line
+of a helper call. So the line number alone does not say which rule
+refused. The checks therefore compare: the very same transaction is refused
+by KeepingCounter and accepted by StrictCounter, which differs only by the
+value rule.
 
 | Question | Result |
 | --- | --- |
@@ -135,7 +138,7 @@ and accepted by StrictCounter, which differs only by the value rule.
 | Can coins be added to the covenant? | Yes: a top-up from a separate input passes. |
 | Must the covenant input or output be first? | No. With an ordinary input first and the covenant input second, an honest move passes and a leak is refused. |
 | Do the earlier rules still hold? | Yes: wrong next state, zero or negative amounts in either transition, and going below zero are refused. |
-| Do the checks notice a weakened rule? | Yes: `tools/mutation_check.py` tries 15 weakenings of this contract — removing a rule, reading input #0 or output #0 instead, allowing one sompi less — and each one fails checks. |
+| Do the checks notice a weakened rule? | Yes: `tools/mutation_check.py` tries 17 weakenings of this contract — removing a rule, reading input #0 or output #0 instead, allowing one sompi less, comparing with a fixed amount — and each one fails checks. |
 
 ### Why not simply check output #0
 
@@ -239,7 +242,7 @@ require(checkSig(owner_sig, owner));
 the contract template, so it cannot change while the covenant lives. The
 signature travels as an extra argument of the transition.
 
-Offline checks: `tests/test_counter_owned.py` (25). A signature commits to a
+Offline checks: `tests/test_counter_owned.py` (28). A signature commits to a
 transaction, so each check builds the same transaction the engine
 synthesizes for its scenario and signs that mirror with a throwaway key.
 
@@ -249,7 +252,7 @@ synthesizes for its scenario and signs that mirror with a throwaway key.
 | Can anybody else? | No: a genuine signature of another key, the owner's signature made for another transaction, a made-up or malformed signature are all refused at the signature line — before any other rule is looked at. |
 | Can the owner break the other rules? | No: one sompi less, a leak hidden behind a big first output, a leak with the covenant input not first, zero or negative amounts, going below zero and a wrong next state are refused although the owner signed them. |
 | Can the owner hand the covenant to another key? | No: a continuation into the same contract with another owner is refused. |
-| What does the signature pin down? | With the default signature type, everything: it cannot be reused for another outcome. A signature of type `None`, which does not cover the outputs, lets whoever holds it choose the move — so the owner must not sign that way. The coin rule holds even then. |
+| What does the signature pin down? | With the default signature type, the whole transaction: it cannot be reused for another outcome. OwnedCounter accepts all six signature types, and the other five pin less. A signature of type `None`, which does not cover the outputs, lets whoever holds it choose the move. So the owner must sign with the default type only. The coin rule holds even then. Step 6 turns this into a rule of the contract. |
 
 The same on testnet-10:
 
@@ -265,27 +268,97 @@ rules off. Full record: `results/testnet-variants-2026-10-06.md`.
 
 **No exit.** Neither KeepingCounter nor OwnedCounter has a way to take the
 coins out again: whatever is locked in them stays locked. That is fine for an
-exercise with test coins and wrong for anything else.
+exercise with test coins and wrong for anything else. Step 6 adds a way out.
+
+## Step 6 — ClosableCounter: a way out for the owner
+
+`contracts/counter_closable.sil` is OwnedCounter with three changes. Offline
+only so far: it has not been put on chain.
+
+**A third move, `close`.** The owner's signature ends the covenant, and the
+coins go wherever the signed transaction sends them:
+
+```
+#[covenant.singleton(mode = transition, termination = allowed)]
+function close(State prev_state, State[] next_states, sig owner_sig) : (State[]) {
+    onlyOwner(owner_sig);
+    require(next_states.length == 0);
+    return(next_states);
+}
+```
+
+The move returns a list of next states, and an empty list ends the covenant.
+This is the "Singleton termination opt-in" of SilverScript's
+[covenant declarations](https://github.com/kaspanet/silverscript/blob/v1.0.0/docs/DECL.md);
+without the words `termination = allowed` this declaration does not compile.
+What the compiler adds to such a move is a check that the outputs match the
+returned list, nothing more. A move that returns a list may just as well
+continue the covenant: the syntax example in that document, used as a
+contract as it stands, would let anyone move a covenant to any count and keep
+only a part of its coins. So `close` has two rules of its own: the owner's
+signature, and an empty list.
+
+A plain `entry` would be the wrong tool for an exit. A probe showed why: an
+ordinary entrypoint added to KeepingCounter gets none of the
+compiler-generated covenant checks, and through it the covenant could be
+continued at any count, with fewer coins, or not at all.
+
+**Only the default signature type.** `onlyOwner` checks the signature and then
+requires its type byte to be the default one. Step 5 showed what a looser
+type allows; for a move that pays the coins out, a `None`-type signature would
+let its holder redirect the whole payout.
+
+**Shared rules in helper functions.** The owner rule and the coin rule are
+written once, in `onlyOwner` and `keepCoins`. All three moves call
+`onlyOwner`; the two counting moves call `keepCoins`, and `close` does not,
+since paying the coins out is what it is for. Writing a rule once does not
+make a move safe by itself: a move can leave the call out, or call something
+weaker. So the checks try each shared rule in each move that should have it.
+
+Checks: `tests/test_counter_closable.py` (33). Every check that carries a
+genuine signature signs the mirror of its own transaction, as in step 5.
+
+| Question | Result |
+| --- | --- |
+| Can the owner close and take the coins? | Yes: to one ordinary output, split between two, with part left as the fee, with the fee from a separate input, from any count, with a coin of another size. |
+| Can anybody else close or count? | No: a genuine signature of another key and a made-up signature are refused at the signature line, in all three moves. With the owner rule not called, the same transaction passes. |
+| Can a signature be reused? | Not on another transaction: the owner's signature for one payout is refused on another, and a signature made for a counting transaction does not close, nor the other way round. A signature commits to the transaction, not to a move: on one and the same transaction it satisfies the owner rule of all three moves, and the other rules let only the intended move through. |
+| Can `close` be used to jump to a chosen count? | No: a continuing output or a non-empty list of next states is refused. Without the empty-list rule the owner's `close` moves the covenant to any count and lets coins out. |
+| Do the counting moves still keep the coins? | Yes: one sompi less, a leak to one or two plain outputs, a leak behind a big first output, a leak with the covenant input not first and a leak from a bigger coin are refused although the owner signed them; the same transactions pass once the coin rule is not called. |
+| Which signature types are accepted? | Only the default one, in all three moves; the other five are refused at the type rule. |
+| Do the checks notice a weakened rule? | Yes: `tools/mutation_check.py` tries 26 weakenings of this contract — among them a move that leaves a helper out, a move that checks only the signature type, and a coin rule that compares with a fixed amount — and each one fails a check of behaviour. |
+
+What this step does not show: how a node treats the closing transaction, and
+whether the larger script still fits the compute budget that the testnet
+program gives a covenant input. The local engine does not count that budget.
 
 ## What none of this shows
 
-- **Simulation is not network validation.** In steps 1–3 calls are executed
-  by the local SilverScript debug engine against a synthetic transaction.
+- **Simulation is not network validation.** In steps 1–3 and 6, and in the
+  offline checks of step 5, calls are executed by the local SilverScript
+  debug engine against a synthetic transaction.
   On testnet-10 there was one run of each scenario for the guide's Counter,
-  KeepingCounter and OwnedCounter, through public nodes. Guard and
-  StrictCounter were never put on chain.
-- **One adversarial pass, not an audit.** On 2026-10-06 the contracts and the
+  KeepingCounter and OwnedCounter, through public nodes. Guard,
+  StrictCounter and ClosableCounter were never put on chain.
+- **Adversarial passes, not an audit.** On 2026-10-06 the contracts and the
   offline checks went through a separate pass whose only job was to break
   them: scripted attacks and a random search over transactions with up to
   three inputs and four outputs against KeepingCounter (re-run here with 3000
   random transactions: none broke a rule). It found no transaction that takes coins out, moves the
   count against the rules or moves OwnedCounter without the owner. It did
   find weak spots in the checks and wrong statements in this file, which were
-  then fixed. That is not a professional audit.
+  then fixed. On 2026-10-07 ClosableCounter went through a pass of the same
+  kind before it was added: scripted attacks and a random search against a
+  written model of the contract. Again no transaction broke a rule, and again
+  the checks and this file had to be corrected. That is not a professional
+  audit.
 - **The local engine has its own behaviour.** It validates only the input
   being debugged, assumes the active input when an output does not name its
   authorizing input, and reports some failures at a line that did not cause
-  them. The checks are written around these three things.
+  them. The checks are written around these three things. Two more things
+  the checks cannot make up for: the engine does not count the compute
+  budget of an input, and it does not compare the script it is given with
+  the coin's lock. By the node's source code, a node does both.
 - **The tooling is marked experimental upstream.** The SDK guide warns that
   the language, the compiler output and the bindings may change, and calls
   covenants the newest and least-settled part.
@@ -322,14 +395,14 @@ python -m venv .venv
   [same guide](https://github.com/kaspanet/kaspa-python-sdk/blob/v2.1.0/docs/learn/silverscript/covenants.md)
   (ISC license).
 - `contracts/counter_strict.sil`, `contracts/counter_keeping.sil`,
-  `contracts/counter_owned.sil`, the tests, the walkthrough scripts and the
-  testnet program — written for this exercise. The way transactions are
-  assembled follows the SDK's
+  `contracts/counter_owned.sil`, `contracts/counter_closable.sil`, the tests,
+  the walkthrough scripts and the testnet program — written for this
+  exercise. The way transactions are assembled follows the SDK's
   [Counter example](https://github.com/kaspanet/kaspa-python-sdk/blob/v2.1.0/examples/silverscript/counter.py)
   (ISC license).
 
 ## Next
 
-- An exit: a rule that lets the owner close the covenant and take the coins
-  back, and nobody else.
+- Not decided: ClosableCounter on testnet-10 — create, count, close — with a
+  look at the compute budget its larger script needs.
 - A proper review before anything here is reused for more than learning.

@@ -55,7 +55,8 @@ def line_of(source: str, fragment: str, occurrence: int = 1) -> int:
             seen += 1
             if seen == occurrence:
                 return number
-    raise AssertionError(f"{fragment!r} (occurrence {occurrence}) not found")
+    # Not a failed assertion: a rule line that is missing says nothing about behaviour.
+    raise LookupError(f"{fragment!r} (occurrence {occurrence}) not found in the contract source")
 
 
 def covenant_output(count: int, value: int = VALUE, covenant_id: str = COVENANT_ID) -> dict:
@@ -241,20 +242,18 @@ class StrictCounter(unittest.TestCase):
         self.assertTrue(transition(STRICT, "subtract", 10, 10, [covenant_output(0)]).success)
 
     def test_add_refuses_zero_and_negative_amounts(self):
-        guard = line_of(STRICT, "require(amount > 0)", occurrence=1)
         for amount, claimed in ((0, 10), (-20, -10)):
             with self.subTest(amount=amount):
                 result = transition(STRICT, "add", 10, amount, [covenant_output(claimed)])
                 self.assertFalse(result.success)
-                self.assertEqual(failing_line(result), guard)
+                self.assertEqual(failing_line(result), line_of(STRICT, "require(amount > 0)", occurrence=1))
 
     def test_subtract_refuses_zero_and_negative_amounts(self):
-        guard = line_of(STRICT, "require(amount > 0)", occurrence=2)
         for amount, claimed in ((0, 10), (-5, 15)):
             with self.subTest(amount=amount):
                 result = transition(STRICT, "subtract", 10, amount, [covenant_output(claimed)])
                 self.assertFalse(result.success)
-                self.assertEqual(failing_line(result), guard)
+                self.assertEqual(failing_line(result), line_of(STRICT, "require(amount > 0)", occurrence=2))
 
     def test_subtract_below_zero_is_still_refused(self):
         result = transition(STRICT, "subtract", 10, 11, [covenant_output(-1)])

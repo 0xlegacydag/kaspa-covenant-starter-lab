@@ -9,9 +9,37 @@ Steps 1–3 run offline on one computer: no network, no wallet, no coins, no
 token, no deployment. Steps 4, 5 and 6 were also run on testnet-10, with test
 coins only. Nothing here ever touched mainnet.
 
-Last successful run of the offline checks: 2026-10-08, 159 checks, all passing.
+Last successful run of the offline checks: 2026-10-08, 166 checks, all passing.
 `tools/mutation_check.py` weakens one contract rule at a time and reruns them:
 all 66 weakenings were noticed.
+
+## At a glance
+
+Six small contracts, each one step further than the one before it. Every
+step says what was asked, what came out, and what it does not show.
+
+| Step | Contract | What it adds | Where it was checked |
+| --- | --- | --- | --- |
+| 1 | Guard | a rule that is checked once | offline |
+| 2 | Counter (from the SDK guide) | a state that moves from coin to coin | offline; a control run on testnet-10 |
+| 2 | StrictCounter | the amount must be positive | offline |
+| 3, 4 | KeepingCounter | the covenant keeps its coins | offline; testnet-10 |
+| 5 | OwnedCounter | only the owner's signature moves it | offline; testnet-10 |
+| 6 | ClosableCounter | a way out for the owner; default signature type only | offline; testnet-10 |
+
+Where to look:
+
+- `contracts/` — the six contracts, a few dozen lines each.
+- `tests/` — the offline checks: what each contract accepts and, above all,
+  what it refuses. They need no network, no key and no coins.
+- `testnet/` — the program that ran the Counter contracts on testnet-10.
+- `results/` — what actually came out: walkthrough output and the records of
+  the testnet runs, with transaction ids.
+- `tools/mutation_check.py` — checks the checks: it weakens one rule at a
+  time and expects the checks to notice.
+
+To run the offline checks, see [Run](#run). Each claim below names the check
+or the record it rests on.
 
 ## Step 1 — Guard: a rule that is checked once
 
@@ -177,12 +205,26 @@ refuses anything else. The key is a throwaway made by `testnet/make_key.py`,
 kept in a file outside the repository and never printed.
 
 Offline checks for how these transactions are assembled:
-`tests/test_testnet_builder.py` (42) — who pays the fee, what the covenant
+`tests/test_testnet_builder.py` (49) — who pays the fee, what the covenant
 output carries, which input is signed, how the owner's signature gets into
-the call, what counts as a node's refusal and what is only a lost answer.
-The program reaches testnet-10 through the SDK's public node resolver (node
-version 2.1.0 on 2026-10-06). `--contract` selects which of the five Counter
-contracts it works with.
+the call, what counts as a node's refusal and what is only a lost answer,
+which coin is taken for the covenant's. The program reaches testnet-10
+through the SDK's public node resolver (node version 2.1.0 on 2026-10-06 and
+2026-10-08). `--contract` selects which of the five Counter contracts it
+works with.
+
+The program has changed since its last testnet run (2026-10-08). It now
+prints the feerate a node suggests, asks a node what it is after every
+reconnect, recognises the covenant's coin by its covenant id and not by the
+address alone, and stops when a fee calculation does not settle. These four
+changes are checked offline only. For the same inputs the program builds the
+same transactions as the revision that ran on testnet.
+
+What is still rough in it: it pays with the largest coin of the acting key,
+which is the most expensive choice; without `--contract` it acts on
+KeepingCounter; `race` records nothing when both moves are accepted or an
+answer is lost; the keys in the offline checks are random, so a check that
+failed once cannot be replayed with the same key.
 
 ### Run of 2026-10-06
 
@@ -439,3 +481,8 @@ python -m venv .venv
 ## Next
 
 - A proper review before anything here is reused for more than learning.
+
+## License
+
+ISC — see `LICENSE`. The two contracts taken from the Kaspa Python SDK guide
+keep that project's ISC notice, which is reproduced in the same file.

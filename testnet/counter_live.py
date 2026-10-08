@@ -254,7 +254,7 @@ def build(plan: Plan, feerate: int) -> tuple:
     fixed_out = sum(value for value, _, _ in plan.fixed_outputs)
     budget_grams = GRAMS_PER_COMPUTE_BUDGET_UNIT * plan.compute_budget
 
-    fee, mass = 0, 0
+    fee, mass, settled = 0, 0, False
     for _ in range(8):
         change = total_in - fixed_out - fee
         if change <= 0:
@@ -262,8 +262,12 @@ def build(plan: Plan, feerate: int) -> tuple:
         mass = calculate_transaction_mass(NETWORK_ID, assemble(plan, change, 0))
         new_fee = (mass + budget_grams + FEE_MASS_SLACK) * feerate
         if new_fee == fee:
+            settled = True
             break
         fee = new_fee
+    if not settled:
+        # Fee and mass kept chasing each other: do not hand back numbers that disagree.
+        raise ValueError("the fee did not settle in eight rounds; use a larger funding input")
     change = total_in - fixed_out - fee
     if change <= 0:
         raise ValueError("the funding input cannot cover the outputs and the fee")
@@ -484,9 +488,12 @@ def set_aside_state(contract: Contract, live: Live, closing_txid: str) -> Path:
 # --------------------------------------------------------------------------
 
 
-async def connect() -> RpcClient:
-    client = RpcClient(resolver=Resolver(), network_id=NETWORK_ID)
-    await asyncio.wait_for(client.connect(), timeout=60)
+async def check_node(client: RpcClient) -> dict:
+    """Refuse a node that is not a synced testnet-10 node.
+
+    Asked after every connection: the first one, and each reconnect, which
+    may land on another node.
+    """
     info = await client.get_server_info()
     if info.get("networkId") != NETWORK_ID:
         await client.disconnect()
@@ -494,6 +501,13 @@ async def connect() -> RpcClient:
     if not info.get("isSynced"):
         await client.disconnect()
         raise SystemExit("Refusing: the node is not synced.")
+    return info
+
+
+async def connect() -> RpcClient:
+    client = RpcClient(resolver=Resolver(), network_id=NETWORK_ID)
+    await asyncio.wait_for(client.connect(), timeout=60)
+    info = await check_node(client)
     print(f"via     : {client.url}, node version {info.get('serverVersion')}", flush=True)
     return client
 
@@ -510,14 +524,18 @@ async def utxos_at(client: RpcClient, address: str) -> list:
             await asyncio.sleep(2 + attempt)
             try:
                 await asyncio.wait_for(client.connect(), timeout=60)
+                await check_node(client)  # a wrong or unsynced node stops the program here
             except Exception:
                 pass
     raise last_error
 
 
 async def feerate(client: RpcClient) -> int:
+    """The feerate the node suggests, in sompi per gram. Printed: fees follow it, and it changes."""
     estimate = await client.get_fee_estimate()
-    return int(estimate["estimate"]["priorityBucket"]["feerate"])
+    rate = int(estimate["estimate"]["priorityBucket"]["feerate"])
+    print(f"feerate : {rate} sompi per gram (the node's estimate)", flush=True)
+    return rate
 
 
 def largest_plain(entries: list) -> dict:
@@ -540,10 +558,22 @@ async def wait_for(client: RpcClient, address: str, txid: str, seconds: int = 60
     raise SystemExit(f"Transaction {txid} was submitted but its output did not appear in {seconds}s.")
 
 
+def is_recorded_covenant(entry: dict, live: Live) -> bool:
+    """Whether a UTXO is the one the state file points at: the recorded transaction and this covenant id.
+
+    The address alone does not say it: another covenant of the same contract
+    at the same count sits at the same address.
+    """
+    return (
+        entry["outpoint"]["transactionId"] == live.txid
+        and entry["utxoEntry"].get("covenantId") == live.covenant_id
+    )
+
+
 async def find_covenant(client: RpcClient, contract: Contract, live: Live) -> dict:
     address = covenant_address(live.count, contract, live.owner)
     for entry in await utxos_at(client, address):
-        if entry["outpoint"]["transactionId"] == live.txid and entry["outpoint"]["index"] == 0:
+        if is_recorded_covenant(entry, live):
             return entry
     raise SystemExit("The covenant UTXO recorded in the state file is not on chain.")
 
@@ -637,7 +667,7 @@ async def cmd_status(client: RpcClient, key: PrivateKey, contract: Contract) -> 
     print(f"value        : {kas(live.value)} TKAS")
     print(f"last tx      : {live.txid}")
     on_chain = await utxos_at(client, covenant_address(live.count, contract, live.owner))
-    found = [e for e in on_chain if e["outpoint"]["transactionId"] == live.txid]
+    found = [e for e in on_chain if is_recorded_covenant(e, live)]
     print(f"on chain     : {bool(found)}")
     if found:
         print(f"value on chain: {kas(found[0]['utxoEntry']['amount'])} TKAS")

@@ -157,6 +157,14 @@ class Transition(BuilderBase):
         budget = live.GRAMS_PER_COMPUTE_BUDGET_UNIT * live.COMPUTE_BUDGET * 2
         self.assertEqual(fee, (tx.mass + budget + live.FEE_MASS_SLACK) * FEERATE)
 
+    def test_a_fee_that_does_not_settle_is_reported(self):
+        plan = live.transition_plan(self.covenant, self.funding, self.change_script, 10, "add", 5)
+        masses = [2000, 3000] * 4  # the mass keeps jumping, so the fee never repeats
+        with mock.patch.object(live, "calculate_transaction_mass", side_effect=masses):
+            with self.assertRaises(ValueError) as raised:
+                live.build(plan, FEERATE)
+        self.assertIn("did not settle", str(raised.exception))
+
     def test_subtract_lands_on_the_lower_count(self):
         plan = live.transition_plan(self.covenant, self.funding, self.change_script, 10, "subtract", 3)
         tx, _, _, _ = live.build(plan, FEERATE)
@@ -198,13 +206,19 @@ class OwnedTransition(BuilderBase):
         self.assertEqual(fee, draft_fee)
         self.assertEqual(signed.mass, draft.mass)
 
-    def test_another_key_produces_a_different_call_for_the_same_covenant(self):
+    def test_only_the_owner_s_signature_passes_the_local_engine(self):
+        # Two signatures never look alike, even of one key, so comparing the calls proves nothing:
+        # the built transactions are put before the local engine instead.
         stranger = PrivateKey(Keypair.random().private_key)
-        mine, _ = live.signed_transition(self.key, FEERATE, **self.owned_args())
-        theirs, _ = live.signed_transition(stranger, FEERATE, **self.owned_args())
-        self.assertNotEqual(
-            mine.inputs[0].signature_script_as_hex, theirs.inputs[0].signature_script_as_hex
-        )
+        args = self.owned_args()
+        mine, _ = live.signed_transition(self.key, FEERATE, **args)
+        theirs, _ = live.signed_transition(stranger, FEERATE, **args)
+
+        def verdict(signed):
+            return local_verdict(signed, args["covenant"], self.funding, OWNED, self.owner, 10, "add", [5])
+
+        self.assertTrue(verdict(mine).success)
+        self.assertFalse(verdict(theirs).success)
         # Both still target the owner's covenant: the owner is fixed by the script, not by the signer.
         self.assertEqual(script_hex(mine), script_hex(theirs))
 
@@ -555,6 +569,89 @@ class Submission(BuilderBase):
         text = "Rejected transaction 12ab: failed to verify the signature script"
         node = FakeNode(RuntimeError(text), seen=[tx.id])
         self.assertEqual(asyncio.run(live.submit_checked(node, tx, self.key)), (False, text))
+
+
+class ScriptedNode:
+    """Stands in for the RPC client where a command reads the network.
+
+    `replies` are the answers to `get_utxos_by_addresses`, in order; an
+    exception among them is raised. `network` and `synced` are what the node
+    says about itself after a reconnect.
+    """
+
+    def __init__(self, replies, network=live.NETWORK_ID, synced=True, rate=100):
+        self.replies = list(replies)
+        self.network, self.synced, self.rate = network, synced, rate
+        self.reconnects = 0
+
+    async def get_utxos_by_addresses(self, request):
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return {"entries": reply}
+
+    async def connect(self):
+        self.reconnects += 1
+
+    async def disconnect(self):
+        return None
+
+    async def get_server_info(self):
+        return {"networkId": self.network, "isSynced": self.synced, "serverVersion": "0.0.0"}
+
+    async def get_fee_estimate(self):
+        return {"estimate": {"priorityBucket": {"feerate": self.rate}}}
+
+
+class ReadingTheNetwork(BuilderBase):
+    """What the program trusts when it reads a node: which coin is the covenant's, and which node it talks to."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.record = live.Live(COVENANT_ID, "bb" * 32, 10, live.COVENANT_VALUE)
+        cls.ours = entry("bb" * 32, 0, live.COVENANT_VALUE, live.lock_script(10), covenant_id=COVENANT_ID)
+
+    def found(self, entries):
+        return asyncio.run(live.find_covenant(ScriptedNode([entries]), live.KEEPING, self.record))
+
+    def test_the_covenant_coin_is_found_by_its_transaction_and_covenant_id(self):
+        self.assertEqual(self.found([self.ours]), self.ours)
+
+    def test_a_coin_of_another_covenant_at_the_same_address_is_not_taken(self):
+        look_alike = entry("bb" * 32, 0, live.COVENANT_VALUE, live.lock_script(10), covenant_id="e2" * 32)
+        plain = entry("bb" * 32, 0, live.COVENANT_VALUE, live.lock_script(10))
+        for other in (look_alike, plain):
+            with self.subTest(covenant_id=other["utxoEntry"]["covenantId"]):
+                with self.assertRaises(SystemExit):
+                    self.found([other])
+        self.assertEqual(self.found([look_alike, self.ours]), self.ours)
+
+    def test_the_covenant_coin_need_not_be_the_first_output(self):
+        second = entry("bb" * 32, 1, live.COVENANT_VALUE, live.lock_script(10), covenant_id=COVENANT_ID)
+        self.assertEqual(self.found([second]), second)
+
+    def test_a_coin_of_another_transaction_is_not_taken(self):
+        stale = entry("cc" * 32, 0, live.COVENANT_VALUE, live.lock_script(10), covenant_id=COVENANT_ID)
+        with self.assertRaises(SystemExit):
+            self.found([stale])
+
+    def test_after_a_dropped_connection_the_node_is_asked_again_what_it_is(self):
+        dropped = ConnectionError("WebSocket is not connected")
+        with mock.patch.object(live.asyncio, "sleep", no_sleep):
+            same = ScriptedNode([dropped, [self.ours]])
+            self.assertEqual(asyncio.run(live.utxos_at(same, "kaspatest:any")), [self.ours])
+            self.assertEqual(same.reconnects, 1)
+            for wrong in (dict(network="mainnet"), dict(synced=False)):
+                with self.subTest(**wrong):
+                    with self.assertRaises(SystemExit):
+                        asyncio.run(live.utxos_at(ScriptedNode([dropped, [self.ours]], **wrong), "kaspatest:any"))
+
+    def test_the_feerate_the_node_suggests_is_printed(self):
+        with mock.patch("builtins.print") as printed:
+            rate = asyncio.run(live.feerate(ScriptedNode([], rate=308)))
+        self.assertEqual(rate, 308)
+        self.assertIn("308", printed.call_args.args[0])
 
 
 class CommandLine(unittest.TestCase):

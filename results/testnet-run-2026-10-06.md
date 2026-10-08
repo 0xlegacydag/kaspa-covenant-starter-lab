@@ -72,3 +72,9 @@ Rejected transaction <id>: failed to verify the signature script: script ran, bu
   No contention between spenders, no other nodes, no reorg.
 - **Who may move.** The contract checks no signature. The covenant UTXO was
   left on testnet at count 2; anyone can move it.
+
+## Correction, 2026-10-08
+
+The list at the top says the test coins came "from a faucet". Which service
+gave them out was not recorded. Read that line as: 1000 test KAS were
+obtained for a throwaway test address before the run.

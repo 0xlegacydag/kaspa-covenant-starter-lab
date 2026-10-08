@@ -9,10 +9,14 @@ Contracts (`--contract`):
     strict    StrictCounter                  amount > 0
     keeping   KeepingCounter (default)       amount > 0, covenant keeps its coins
     owned     OwnedCounter                   as keeping, plus the owner's signature
+    closable  ClosableCounter                as owned, default signature type only,
+                                             plus `close`: the owner ends the covenant
 
 The covenant never pays a fee here. Every transition has two inputs — the
 covenant UTXO and an ordinary funding UTXO that pays the fee — and two
-outputs — the next covenant UTXO and the change.
+outputs — the next covenant UTXO and the change. A closing transaction has
+the same two inputs; its outputs are the payout of the covenant's coins to
+the acting key and the change.
 
     set KASPA_LAB_KEY_FILE=C:\\path\\outside\\the\\repo\\tn10-test-key.txt
     set KASPA_LAB_STATE_DIR=C:\\path\\outside\\the\\repo\\state
@@ -27,14 +31,28 @@ outputs — the next covenant UTXO and the change.
     python -m testnet.counter_live send kaspatest:... 20
     python -m testnet.counter_live race
     python -m testnet.counter_live --contract owned resync 5
+    python -m testnet.counter_live --contract closable close
+    python -m testnet.counter_live --contract closable try close-continue
+    python -m testnet.counter_live --contract closable try close-none
+    python -m testnet.counter_live --contract closable --budget 12 move add 5
 
-`KASPA_LAB_KEY_FILE` is the key that acts: it pays the fees and, for `owned`,
-signs the transition. Point it at another key to act as somebody else.
-`try ...` submits a transaction that breaks a rule and reports what the node
-answers. `race` submits two different moves that spend the same covenant
-UTXO; the second one is paid by `KASPA_LAB_SECOND_KEY_FILE`. `resync N`
-repairs the state file after an interrupted run by finding this covenant's
-UTXO on chain at count N.
+`KASPA_LAB_KEY_FILE` is the key that acts: it pays the fees and, for `owned`
+and `closable`, signs the covenant input. Point it at another key to act as
+somebody else. `try ...` submits a transaction that breaks a rule and reports
+what the node answers. `race` submits two different moves that spend the same
+covenant UTXO; the second one is paid by `KASPA_LAB_SECOND_KEY_FILE`.
+`resync N` repairs the state file after an interrupted run by finding this
+covenant's UTXO on chain at count N. `close` ends a `closable` covenant: its
+coins are paid out to the acting key, and the state file is set aside.
+`--budget N` sets the compute budget of the covenant input for `move`, `try`
+and `close`; the default is 10, and it is not remembered between commands.
+
+Only a node's own answer ("Rejected transaction ...") is reported as a
+refusal. When a submission ends without an answer, the program looks for the
+transaction's change output; if it cannot find it, it stops with NO ANSWER
+and records nothing. A record set aside by `close` does not come back by
+itself: if the closing transaction did not stay on chain, copy the record
+back to `tn10-closable.json` by hand.
 """
 
 import asyncio
@@ -53,6 +71,7 @@ from kaspa import (
     Resolver,
     RpcClient,
     ScriptBuilder,
+    SighashType,
     Transaction,
     TransactionInput,
     TransactionOutpoint,
@@ -83,6 +102,7 @@ SOMPI_PER_KAS = 100_000_000
 COVENANT_VALUE = 2 * SOMPI_PER_KAS  # coins locked in the covenant at genesis
 LEAK = 1 * SOMPI_PER_KAS  # what the `try leak` transaction tries to take out
 SIGNATURE_PLACEHOLDER = bytes(64) + b"\x01"  # same size as a real signature
+JUMP = 6  # how far `try close-continue` tries to move the count through `close`
 
 
 # --------------------------------------------------------------------------
@@ -95,6 +115,7 @@ class Contract:
     name: str
     file: str
     owned: bool = False
+    closable: bool = False
 
     @property
     def source(self) -> str:
@@ -106,6 +127,7 @@ CONTRACTS = {
     "strict": Contract("strict", "counter_strict.sil"),
     "keeping": Contract("keeping", "counter_keeping.sil"),
     "owned": Contract("owned", "counter_owned.sil", owned=True),
+    "closable": Contract("closable", "counter_closable.sil", owned=True, closable=True),
 }
 KEEPING = CONTRACTS["keeping"]
 
@@ -131,6 +153,24 @@ def covenant_address(count: int, contract: Contract = KEEPING, owner: str | None
     return address_from_script_public_key(script, NETWORK_TYPE).to_string()
 
 
+def covenant_call(
+    count: int,
+    function: str,
+    arguments: list,
+    contract: Contract = KEEPING,
+    owner: str | None = None,
+    signature: bytes | None = None,
+) -> bytes:
+    """Covenant call for `function(*arguments[, signature])` plus the pushed redeem script."""
+    program = compiled(contract, count, owner)
+    args = list(arguments)
+    if contract.owned:
+        args.append(signature or SIGNATURE_PLACEHOLDER)
+    call = program.build_sig_script_for_covenant_decl(function, args)
+    redeem = bytes.fromhex(ScriptBuilder().add_data(program.bytecode).to_string())
+    return call + redeem
+
+
 def unlock_script(
     count: int,
     function: str,
@@ -139,14 +179,8 @@ def unlock_script(
     owner: str | None = None,
     signature: bytes | None = None,
 ) -> bytes:
-    """Covenant call for `function(amount[, signature])` plus the pushed redeem script."""
-    program = compiled(contract, count, owner)
-    args = [amount]
-    if contract.owned:
-        args.append(signature or SIGNATURE_PLACEHOLDER)
-    call = program.build_sig_script_for_covenant_decl(function, args)
-    redeem = bytes.fromhex(ScriptBuilder().add_data(program.bytecode).to_string())
-    return call + redeem
+    """Covenant call for the counting move `function(amount[, signature])`."""
+    return covenant_call(count, function, [amount], contract, owner, signature)
 
 
 def next_count(count: int, function: str, amount: int) -> int:
@@ -172,15 +206,22 @@ class Plan:
     change_script: object  # where the remainder goes
     genesis: bool = False
 
+    @property
+    def compute_budget(self) -> int:
+        """Units of compute budget over all inputs: the node charges mass for each of them."""
+        return sum(tx_input.compute_budget for tx_input in self.inputs)
 
-def make_input(entry: dict, signature_script: bytes = b"") -> TransactionInput:
+
+def make_input(
+    entry: dict, signature_script: bytes = b"", compute_budget: int = COMPUTE_BUDGET
+) -> TransactionInput:
     outpoint = entry["outpoint"]
     return TransactionInput(
         TransactionOutpoint(Hash(outpoint["transactionId"]), outpoint["index"]),
         signature_script,
         sequence=0,
         sig_op_count=0,
-        compute_budget=COMPUTE_BUDGET,
+        compute_budget=compute_budget,
         utxo=UtxoEntryReference.from_dict(entry),
     )
 
@@ -211,7 +252,7 @@ def build(plan: Plan, feerate: int) -> tuple:
     """
     total_in = sum(plan.input_values)
     fixed_out = sum(value for value, _, _ in plan.fixed_outputs)
-    budget_grams = GRAMS_PER_COMPUTE_BUDGET_UNIT * COMPUTE_BUDGET * len(plan.inputs)
+    budget_grams = GRAMS_PER_COMPUTE_BUDGET_UNIT * plan.compute_budget
 
     fee, mass = 0, 0
     for _ in range(8):
@@ -258,11 +299,13 @@ def transition_plan(
     signature: bytes | None = None,
     claimed_count: int | None = None,
     covenant_value_out: int | None = None,
+    covenant_budget: int = COMPUTE_BUDGET,
 ) -> Plan:
     """Spend the covenant UTXO at `count` by calling `function(amount)`.
 
     `claimed_count` and `covenant_value_out` default to the honest values;
     the `try ...` commands override them to break a rule on purpose.
+    `covenant_budget` is the compute budget of the covenant input.
     """
     value_in = covenant["utxoEntry"]["amount"]
     covenant_id = covenant["utxoEntry"]["covenantId"]
@@ -273,11 +316,52 @@ def transition_plan(
     binding = CovenantBinding(authorizing_input=0, covenant_id=Hash(covenant_id))
     call = unlock_script(count, function, amount, contract, owner, signature)
     return Plan(
-        inputs=[make_input(covenant, call), make_input(funding)],
+        inputs=[make_input(covenant, call, covenant_budget), make_input(funding)],
         input_values=[value_in, funding["utxoEntry"]["amount"]],
         fixed_outputs=[
             (covenant_value_out, lock_script(claimed_count, contract, owner), binding)
         ],
+        change_script=change_script,
+    )
+
+
+def closing_plan(
+    covenant: dict,
+    funding: dict,
+    change_script,
+    count: int,
+    payout_script,
+    *,
+    contract: Contract,
+    owner: str | None = None,
+    signature: bytes | None = None,
+    continue_at: int | None = None,
+    covenant_budget: int = COMPUTE_BUDGET,
+) -> Plan:
+    """Spend the covenant UTXO at `count` by calling `close`: the covenant ends.
+
+    There is no covenant output: the covenant's coins go to `payout_script` in
+    full, and the funding input pays the fee. `continue_at` breaks the rule on
+    purpose (`try close-continue`): the coins then stay in a covenant output
+    at that count, and the call names it as the next state.
+    """
+    if not contract.closable:
+        raise ValueError(f"the {contract.name} contract has no closing move")
+    value_in = covenant["utxoEntry"]["amount"]
+    if continue_at is None:
+        next_states = []
+        fixed_outputs = [(value_in, payout_script, None)]
+    else:
+        binding = CovenantBinding(
+            authorizing_input=0, covenant_id=Hash(covenant["utxoEntry"]["covenantId"])
+        )
+        next_states = [{"count": continue_at}]
+        fixed_outputs = [(value_in, lock_script(continue_at, contract, owner), binding)]
+    call = covenant_call(count, "close", [next_states], contract, owner, signature)
+    return Plan(
+        inputs=[make_input(covenant, call, covenant_budget), make_input(funding)],
+        input_values=[value_in, funding["utxoEntry"]["amount"]],
+        fixed_outputs=fixed_outputs,
         change_script=change_script,
     )
 
@@ -292,20 +376,30 @@ def transfer_plan(funding: dict, change_script, to_script, amount: int) -> Plan:
     )
 
 
-def signed_transition(key: PrivateKey, feerate: int, **plan_args) -> tuple:
-    """Build and sign a transition. Returns (transaction, fee).
+def signed_transition(
+    key: PrivateKey, feerate: int, *, planner=None, sighash: str | None = None, **plan_args
+) -> tuple:
+    """Build and sign a transaction that spends the covenant UTXO. Returns (transaction, fee).
+
+    `planner` is `transition_plan` (the default) or `closing_plan`.
 
     For an owned contract the acting key also signs the covenant input, and
     that signature travels inside the covenant call. A signature does not
     cover signature scripts, so the transaction is first built with a
     placeholder of the same size, signed, and rebuilt with the real one.
+    `sighash` names a signature type other than the default one, for the
+    attempts that break the type rule on purpose (`try close-none`).
     """
+    planner = planner or transition_plan
     contract = plan_args.get("contract", KEEPING)
-    tx, fee, change, mass = build(transition_plan(**plan_args), feerate)
+    tx, fee, change, mass = build(planner(**plan_args), feerate)
     if contract.owned:
-        pushed = bytes.fromhex(create_input_signature(tx, 0, key))
-        signature = pushed[1:]  # drop the one-byte push opcode, keep 64 + sighash type
-        tx = assemble(transition_plan(**plan_args, signature=signature), change, mass)
+        if sighash is None:
+            pushed = create_input_signature(tx, 0, key)
+        else:
+            pushed = create_input_signature(tx, 0, key, getattr(SighashType, sighash))
+        signature = bytes.fromhex(pushed)[1:]  # drop the one-byte push opcode, keep 64 + sighash type
+        tx = assemble(planner(**plan_args, signature=signature), change, mass)
     # The funding input is an ordinary one; the covenant call is left as it is.
     return sign_transaction(tx, [key], False), fee
 
@@ -353,7 +447,9 @@ def load_state(contract: Contract) -> Live | None:
     path = state_path(contract)
     if not path.exists():
         return None
-    return Live(**json.loads(path.read_text(encoding="utf-8")))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    # A record that was set aside carries one more key; it loads all the same.
+    return Live(**{name: record[name] for name in Live.__dataclass_fields__ if name in record})
 
 
 def save_state(contract: Contract, live: Live) -> None:
@@ -367,6 +463,20 @@ def need_state(contract: Contract) -> Live:
     if live is None:
         raise SystemExit(f"No {contract.name} covenant yet. Run `genesis` first.")
     return live
+
+
+def set_aside_state(contract: Contract, live: Live, closing_txid: str) -> Path:
+    """After a covenant has been closed: keep its last record under another name.
+
+    The live state file is removed, so `genesis` can start a new covenant of
+    this contract; the record of the closed one stays next to it.
+    """
+    path = state_path(contract)
+    closed = path.with_name(f"tn10-{contract.name}-closed-{closing_txid[:12]}.json")
+    record = {**asdict(live), "closed_by": closing_txid}
+    closed.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    path.unlink()
+    return closed
 
 
 # --------------------------------------------------------------------------
@@ -384,6 +494,7 @@ async def connect() -> RpcClient:
     if not info.get("isSynced"):
         await client.disconnect()
         raise SystemExit("Refusing: the node is not synced.")
+    print(f"via     : {client.url}, node version {info.get('serverVersion')}", flush=True)
     return client
 
 
@@ -437,13 +548,58 @@ async def find_covenant(client: RpcClient, contract: Contract, live: Live) -> di
     raise SystemExit("The covenant UTXO recorded in the state file is not on chain.")
 
 
+REFUSAL_MARK = "Rejected transaction"  # how a node's refusal begins
+
+
+class NoAnswer(Exception):
+    """A submission ended without the node's answer: the node may have taken the transaction."""
+
+    def __init__(self, reason: str, txid: str):
+        super().__init__(reason)
+        self.txid = txid
+
+
 async def submit(client: RpcClient, tx: Transaction) -> tuple:
-    """Return (accepted, transaction id or the node's refusal)."""
+    """Return (accepted, transaction id or the node's refusal).
+
+    Only the node's own answer counts as a refusal. Any other failure — a
+    dropped connection, a timeout — raises `NoAnswer`: the transaction may
+    have been accepted all the same.
+    """
     try:
         result = await client.submit_transaction({"transaction": tx, "allowOrphan": False})
-    except Exception as error:  # the node's refusal arrives as an exception
-        return False, str(error)[:700]
+    except Exception as error:  # the node's refusal arrives as an exception too
+        reason = str(error)[:700]
+        if REFUSAL_MARK in reason:
+            return False, reason
+        raise NoAnswer(reason, tx.id) from error
     return True, result["transactionId"]
+
+
+async def seen_at(client: RpcClient, address: str, txid: str, seconds: int = 30) -> bool:
+    """Whether an output of transaction `txid` shows up at `address` within `seconds`."""
+    for _ in range(seconds):
+        if any(entry["outpoint"]["transactionId"] == txid for entry in await utxos_at(client, address)):
+            return True
+        await asyncio.sleep(1)
+    return False
+
+
+async def submit_checked(client: RpcClient, tx: Transaction, key: PrivateKey) -> tuple:
+    """`submit`; when the answer is lost, look for the transaction's change output.
+
+    Every transaction built here returns its change to the acting key. If
+    that output shows up at the key's address, the node had accepted the
+    transaction although its answer did not arrive. If it does not show up,
+    `NoAnswer` is raised: nothing is known, and nothing is recorded.
+    """
+    try:
+        return await submit(client, tx)
+    except NoAnswer as lost:
+        print(f"node    : NO ANSWER ({lost}); looking for the change output of {lost.txid}", flush=True)
+        if await seen_at(client, address_of(key), lost.txid):
+            return True, lost.txid
+        raise
 
 
 def kas(sompi: int) -> str:
@@ -467,8 +623,11 @@ async def cmd_status(client: RpcClient, key: PrivateKey, contract: Contract) -> 
     print(f"balance      : {kas(balance)} TKAS in {len(entries)} UTXO(s)")
     live = load_state(contract)
     print(f"contract     : {contract.name}")
+    closed = sorted(state_path(contract).parent.glob(f"tn10-{contract.name}-closed-*.json"))
+    if closed:
+        print(f"closed before: {len(closed)} covenant(s), records {', '.join(path.name for path in closed)}")
     if live is None:
-        print("covenant     : not created yet")
+        print("covenant     : no live covenant recorded")
         return
     print(f"covenant id  : {live.covenant_id}")
     if live.owner:
@@ -491,7 +650,7 @@ async def cmd_genesis(client: RpcClient, key: PrivateKey, contract: Contract) ->
     plan = genesis_plan(await funding_for(client, key), script_of(key), contract=contract, owner=owner)
     tx, fee, _, _ = build(plan, await feerate(client))
     covenant_id = tx.outputs[0].to_dict()["covenant"]["covenantId"]
-    accepted, answer = await submit(client, sign_transaction(tx, [key], True))
+    accepted, answer = await submit_checked(client, sign_transaction(tx, [key], True), key)
     if not accepted:
         raise SystemExit(f"genesis REFUSED: {answer}")
     print(f"genesis accepted: {answer}", flush=True)
@@ -519,7 +678,12 @@ async def cmd_resync(client: RpcClient, contract: Contract, count: int) -> None:
 
 
 async def cmd_move(
-    client: RpcClient, key: PrivateKey, contract: Contract, function: str, amount: int
+    client: RpcClient,
+    key: PrivateKey,
+    contract: Contract,
+    function: str,
+    amount: int,
+    budget: int = COMPUTE_BUDGET,
 ) -> None:
     live = need_state(contract)
     tx, fee = signed_transition(
@@ -533,9 +697,11 @@ async def cmd_move(
         amount=amount,
         contract=contract,
         owner=live.owner,
+        covenant_budget=budget,
     )
-    accepted, answer = await submit(client, tx)
     print(f"attempt : {function}({amount}) on count {live.count}, paid by {address_of(key)}", flush=True)
+    print(f"budget  : {budget} (covenant input)", flush=True)
+    accepted, answer = await submit_checked(client, tx, key)
     if not accepted:
         print("node    : REFUSED")
         print(f"reason  : {answer}")
@@ -548,7 +714,99 @@ async def cmd_move(
     print(f"result  : count {live.count} -> {new_count}, covenant holds {kas(live.value)} TKAS, fee {kas(fee)} TKAS")
 
 
-async def cmd_try(client: RpcClient, key: PrivateKey, contract: Contract, what: str) -> None:
+async def cmd_close(
+    client: RpcClient, key: PrivateKey, contract: Contract, budget: int = COMPUTE_BUDGET
+) -> None:
+    """End a closable covenant: its coins are paid out to the acting key."""
+    if not contract.closable:
+        raise SystemExit(f"The {contract.name} contract has no closing move.")
+    live = need_state(contract)
+    mine = key.to_keypair().xonly_public_key == live.owner
+    tx, fee = signed_transition(
+        key,
+        await feerate(client),
+        planner=closing_plan,
+        covenant=await find_covenant(client, contract, live),
+        funding=await funding_for(client, key),
+        change_script=script_of(key),
+        count=live.count,
+        payout_script=script_of(key),
+        contract=contract,
+        owner=live.owner,
+        covenant_budget=budget,
+    )
+    who = "the owner" if mine else "a key that is NOT the owner"
+    print(f"attempt : close on count {live.count}, signed and paid by {who}, {address_of(key)}", flush=True)
+    print(f"budget  : {budget} (covenant input)", flush=True)
+    accepted, answer = await submit_checked(client, tx, key)
+    if not accepted:
+        print("node    : REFUSED")
+        print(f"reason  : {answer}")
+        return
+    print(f"node    : ACCEPTED {answer}", flush=True)
+    # Set the record aside before waiting, so that a dropped connection does not
+    # leave a live record of a covenant that no longer exists.
+    closed = set_aside_state(contract, live, answer)
+    await wait_for(client, address_of(key), answer)
+    print(f"result  : the covenant is closed, {kas(live.value)} TKAS paid out to {address_of(key)}, fee {kas(fee)} TKAS")
+    print(f"record  : {closed.name}")
+
+
+async def cmd_try_close(
+    client: RpcClient, key: PrivateKey, contract: Contract, what: str, budget: int = COMPUTE_BUDGET
+) -> None:
+    """Closing transactions that break a rule of `close` on purpose."""
+    if not contract.closable:
+        raise SystemExit(f"The {contract.name} contract has no closing move.")
+    live = need_state(contract)
+    jump = live.count + JUMP
+    who = "the owner" if key.to_keypair().xonly_public_key == live.owner else "a key that is NOT the owner"
+    if what == "close-continue":
+        extra, sighash = dict(continue_at=jump), None
+        label = f"close signed by {who}, but the coins stay in a covenant output at count {jump}, named as the next state"
+    else:
+        extra, sighash = {}, "None"
+        label = f"close signed by {who} with a signature of type None"
+    tx, _ = signed_transition(
+        key,
+        await feerate(client),
+        planner=closing_plan,
+        sighash=sighash,
+        covenant=await find_covenant(client, contract, live),
+        funding=await funding_for(client, key),
+        change_script=script_of(key),
+        count=live.count,
+        payout_script=script_of(key),
+        contract=contract,
+        owner=live.owner,
+        covenant_budget=budget,
+        **extra,
+    )
+    print(f"attempt : {label}", flush=True)
+    print(f"budget  : {budget} (covenant input)", flush=True)
+    accepted, answer = await submit_checked(client, tx, key)
+    if not accepted:
+        print("node    : REFUSED")
+        print(f"reason  : {answer}")
+        return
+    print(f"node    : ACCEPTED {answer}", flush=True)
+    # The rule did not hold on chain: follow the covenant to where it went.
+    if what == "close-continue":
+        save_state(contract, Live(live.covenant_id, answer, jump, live.value, live.owner))
+        await wait_for(client, covenant_address(jump, contract, live.owner), answer)
+        print(f"result  : count {live.count} -> {jump} through `close`")
+    else:
+        closed = set_aside_state(contract, live, answer)
+        await wait_for(client, address_of(key), answer)
+        print(f"result  : the covenant is closed by a signature of type None; record {closed.name}")
+
+
+async def cmd_try(
+    client: RpcClient, key: PrivateKey, contract: Contract, what: str, budget: int = COMPUTE_BUDGET
+) -> None:
+    if what in ("close-continue", "close-none"):
+        await cmd_try_close(client, key, contract, what, budget)
+        return
     live = need_state(contract)
     value_out, claimed, amount = live.value, None, 5
     if what == "leak":
@@ -561,7 +819,7 @@ async def cmd_try(client: RpcClient, key: PrivateKey, contract: Contract, what: 
         amount = -20
         label = f"add(-20) on count {live.count}"
     else:
-        raise SystemExit("try what? leak | wrong-state | negative")
+        raise SystemExit("try what? leak | wrong-state | negative | close-continue | close-none")
 
     tx, _ = signed_transition(
         key,
@@ -576,9 +834,11 @@ async def cmd_try(client: RpcClient, key: PrivateKey, contract: Contract, what: 
         owner=live.owner,
         claimed_count=claimed,
         covenant_value_out=value_out,
+        covenant_budget=budget,
     )
-    accepted, answer = await submit(client, tx)
     print(f"attempt : {label}", flush=True)
+    print(f"budget  : {budget} (covenant input)", flush=True)
+    accepted, answer = await submit_checked(client, tx, key)
     if not accepted:
         print("node    : REFUSED")
         print(f"reason  : {answer}")
@@ -601,7 +861,7 @@ async def cmd_send(client: RpcClient, key: PrivateKey, to_address: str, amount_k
         await funding_for(client, key), script_of(key), pay_to_address_script(Address(to_address)), amount
     )
     tx, fee, _, _ = build(plan, await feerate(client))
-    accepted, answer = await submit(client, sign_transaction(tx, [key], True))
+    accepted, answer = await submit_checked(client, sign_transaction(tx, [key], True), key)
     if not accepted:
         raise SystemExit(f"send REFUSED: {answer}")
     await wait_for(client, to_address, answer)
@@ -621,12 +881,22 @@ async def cmd_race(client: RpcClient, key: PrivateKey, contract: Contract) -> No
     second_tx, _ = signed_transition(
         second, rate, funding=await funding_for(client, second), change_script=script_of(second), amount=2, **common
     )
-    first = await submit(client, first_tx)
-    other = await submit(client, second_tx)
+    async def raced(tx: Transaction) -> tuple:
+        try:
+            return await submit(client, tx)
+        except NoAnswer as lost:
+            return None, f"NO ANSWER ({lost}); transaction {lost.txid}"
+
+    first = await raced(first_tx)
+    other = await raced(second_tx)
     for label, (accepted, answer) in (("add(1), first", first), ("add(2), second", other)):
-        print(f"{label:<15}: {'ACCEPTED ' + answer if accepted else 'REFUSED'}")
+        verdict = "ACCEPTED " + answer if accepted else "REFUSED" if accepted is False else "UNKNOWN"
+        print(f"{label:<15}: {verdict}")
         if not accepted:
             print(f"reason         : {answer}")
+    if first[0] is None or other[0] is None:
+        print("An answer was lost: nothing is recorded. Run `status`, then `resync N`.")
+        return
     if first[0] and not other[0]:
         save_state(contract, Live(live.covenant_id, first[1], live.count + 1, live.value, live.owner))
         await wait_for(client, covenant_address(live.count + 1, contract, live.owner), first[1])
@@ -637,14 +907,32 @@ async def cmd_race(client: RpcClient, key: PrivateKey, contract: Contract) -> No
         print("Both were accepted into the mempool; check `status` to see which one the chain kept.")
 
 
-async def run(argv: list) -> None:
-    contract = KEEPING
-    if len(argv) >= 2 and argv[0] == "--contract":
-        if argv[1] not in CONTRACTS:
-            raise SystemExit(f"--contract must be one of: {', '.join(CONTRACTS)}")
-        contract, argv = CONTRACTS[argv[1]], argv[2:]
-    if not argv:
+MAX_COMPUTE_BUDGET = 65535  # the field is 16 bits wide
+BUDGET_COMMANDS = ("move", "try", "close")
+
+
+def options(argv: list) -> tuple:
+    """Split `--contract NAME` and `--budget N`, in either order, from the command. No network."""
+    contract, budget = KEEPING, None
+    while len(argv) >= 2 and argv[0] in ("--contract", "--budget"):
+        option, value, argv = argv[0], argv[1], argv[2:]
+        if option == "--contract":
+            if value not in CONTRACTS:
+                raise SystemExit(f"--contract must be one of: {', '.join(CONTRACTS)}")
+            contract = CONTRACTS[value]
+        else:
+            if not value.isdecimal() or int(value) > MAX_COMPUTE_BUDGET:
+                raise SystemExit(f"--budget must be a whole number from 0 to {MAX_COMPUTE_BUDGET}")
+            budget = int(value)
+    if not argv or argv[0].startswith("--"):
         raise SystemExit(__doc__)
+    if budget is not None and argv[0] not in BUDGET_COMMANDS:
+        raise SystemExit(f"--budget applies to {', '.join(BUDGET_COMMANDS)} only")
+    return contract, COMPUTE_BUDGET if budget is None else budget, argv
+
+
+async def run(argv: list) -> None:
+    contract, budget, argv = options(argv)
     key = load_key()
     client = await connect()
     try:
@@ -654,9 +942,11 @@ async def run(argv: list) -> None:
         elif command == "genesis" and len(argv) == 1:
             await cmd_genesis(client, key, contract)
         elif command == "move" and len(argv) == 3 and argv[1] in ("add", "subtract"):
-            await cmd_move(client, key, contract, argv[1], int(argv[2]))
+            await cmd_move(client, key, contract, argv[1], int(argv[2]), budget)
         elif command == "try" and len(argv) == 2:
-            await cmd_try(client, key, contract, argv[1])
+            await cmd_try(client, key, contract, argv[1], budget)
+        elif command == "close" and len(argv) == 1:
+            await cmd_close(client, key, contract, budget)
         elif command == "send" and len(argv) == 3:
             await cmd_send(client, key, argv[1], argv[2])
         elif command == "race" and len(argv) == 1:
@@ -665,6 +955,12 @@ async def run(argv: list) -> None:
             await cmd_resync(client, contract, int(argv[1]))
         else:
             raise SystemExit(__doc__)
+    except NoAnswer as lost:
+        raise SystemExit(
+            f"NO ANSWER from the node: {lost}\n"
+            f"Transaction {lost.txid} may have been accepted all the same, and nothing was recorded.\n"
+            "Run `status` before anything else; if the covenant moved, `resync N` repairs the record."
+        )
     finally:
         await client.disconnect()
 

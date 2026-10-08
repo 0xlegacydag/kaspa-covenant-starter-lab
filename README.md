@@ -9,7 +9,7 @@ Steps 1–3 and 6 run offline on one computer: no network, no wallet, no coins,
 no token, no deployment. Steps 4 and 5 were also run on testnet-10, with test
 coins only. Nothing here ever touched mainnet.
 
-Last successful run of the offline checks: 2026-10-07, 134 checks, all passing.
+Last successful run of the offline checks: 2026-10-08, 159 checks, all passing.
 `tools/mutation_check.py` weakens one contract rule at a time and reruns them:
 all 66 weakenings were noticed.
 
@@ -177,11 +177,12 @@ refuses anything else. The key is a throwaway made by `testnet/make_key.py`,
 kept in a file outside the repository and never printed.
 
 Offline checks for how these transactions are assembled:
-`tests/test_testnet_builder.py` (17) — who pays the fee, what the covenant
+`tests/test_testnet_builder.py` (42) — who pays the fee, what the covenant
 output carries, which input is signed, how the owner's signature gets into
-the call. The program reaches testnet-10 through the SDK's public node
-resolver (node version 2.1.0 on 2026-10-06). `--contract` selects which of
-the four Counter contracts it works with.
+the call, what counts as a node's refusal and what is only a lost answer.
+The program reaches testnet-10 through the SDK's public node resolver (node
+version 2.1.0 on 2026-10-06). `--contract` selects which of the five Counter
+contracts it works with.
 
 ### Run of 2026-10-06
 

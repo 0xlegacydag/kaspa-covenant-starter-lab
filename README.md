@@ -5,8 +5,8 @@ A small learning exercise on native Kaspa L1 scripts written in
 
 **Status: work in progress. Educational, unaudited, not for real funds.**
 
-Steps 1–3 and 6 run offline on one computer: no network, no wallet, no coins,
-no token, no deployment. Steps 4 and 5 were also run on testnet-10, with test
+Steps 1–3 run offline on one computer: no network, no wallet, no coins, no
+token, no deployment. Steps 4, 5 and 6 were also run on testnet-10, with test
 coins only. Nothing here ever touched mainnet.
 
 Last successful run of the offline checks: 2026-10-08, 159 checks, all passing.
@@ -273,8 +273,8 @@ exercise with test coins and wrong for anything else. Step 6 adds a way out.
 
 ## Step 6 — ClosableCounter: a way out for the owner
 
-`contracts/counter_closable.sil` is OwnedCounter with three changes. Offline
-only so far: it has not been put on chain.
+`contracts/counter_closable.sil` is OwnedCounter with three changes. Checked
+offline first; the testnet-10 run is at the end of this step.
 
 **A third move, `close`.** The owner's signature ends the covenant, and the
 coins go wherever the signed transaction sends them:
@@ -329,18 +329,52 @@ genuine signature signs the mirror of its own transaction, as in step 5.
 | Which signature types are accepted? | Only the default one, in all three moves; the other five are refused at the type rule. |
 | Do the checks notice a weakened rule? | Yes: `tools/mutation_check.py` tries 26 weakenings of this contract — among them a move that leaves a helper out, a move that checks only the signature type, and a coin rule that compares with a fixed amount — and each one fails a check of behaviour. |
 
-What this step does not show: how a node treats the closing transaction, and
-whether the larger script still fits the compute budget that the testnet
-program gives a covenant input. The local engine does not count that budget.
+### ClosableCounter on testnet-10
+
+Run of 2026-10-08, full record with transaction ids:
+`results/testnet-closable-2026-10-08.md`. Two covenants were created. The
+first one only to see the honest path work — create, close — because a node
+gives the same message for every script failure: had the closing transaction
+been built wrongly, every "refusal" after it would have meant nothing.
+
+| Action on testnet-10 | Signed by | Node answer |
+| --- | --- | --- |
+| `genesis`, then `close` | owner | accepted: the 2 test KAS came back to the owner's address |
+| `genesis`, `move add 5` | owner | accepted |
+| `try leak` — only 1 of 2 test KAS stays | owner | refused |
+| `try close-continue` — `close` that keeps the covenant at another count | owner | refused |
+| `try close-none` — `close` with a signature of type `None` | owner | refused |
+| `close` | another key | refused |
+| `close` | owner | accepted: the 2 test KAS came back |
+
+The compute budget that the earlier contracts ran with was enough for this
+larger script. The local engine does not count that budget, so only a node
+could say.
+
+The refused `None`-type attempt and the accepted `close` that followed have
+the same transaction id: an id does not cover signature scripts, and the two
+transactions differ only in the owner's signature inside the call. For this
+one rule the network itself shows the comparison — the same transaction
+passes once the signature is of the default type.
+
+Offline checks of how these transactions are built:
+`tests/test_testnet_builder.py`, class `Closable`. Each transaction is built
+and signed as for the network and then put before the local engine. This
+works because a signature commits to neither the compute budget nor the
+mass. It does not show that a node reads the call bytes the same way: the
+engine runs the arguments it is handed, not the bytes of the call.
+
+What this step does not show: `subtract` and the other refusals of the
+counting moves on a node; how much of the compute budget the script used.
 
 ## What none of this shows
 
-- **Simulation is not network validation.** In steps 1–3 and 6, and in the
-  offline checks of step 5, calls are executed by the local SilverScript
+- **Simulation is not network validation.** In steps 1–3, and in the offline
+  checks of steps 5 and 6, calls are executed by the local SilverScript
   debug engine against a synthetic transaction.
   On testnet-10 there was one run of each scenario for the guide's Counter,
-  KeepingCounter and OwnedCounter, through public nodes. Guard,
-  StrictCounter and ClosableCounter were never put on chain.
+  KeepingCounter, OwnedCounter and ClosableCounter, through public nodes.
+  Guard and StrictCounter were never put on chain.
 - **Adversarial passes, not an audit.** On 2026-10-06 the contracts and the
   offline checks went through a separate pass whose only job was to break
   them: scripted attacks and a random search over transactions with up to
@@ -404,6 +438,4 @@ python -m venv .venv
 
 ## Next
 
-- Not decided: ClosableCounter on testnet-10 — create, count, close — with a
-  look at the compute budget its larger script needs.
 - A proper review before anything here is reused for more than learning.

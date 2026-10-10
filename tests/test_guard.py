@@ -82,6 +82,21 @@ class GuardCalls(unittest.TestCase):
                 result = simulate(amount)
                 self.assertFalse(result.success)
 
+    def test_the_threshold_is_read_from_the_contract_not_hard_coded(self):
+        # Every other call here is made with threshold 100, and the compiler folds the constructor
+        # argument into the script: a rule reading `amount > 100` has the very same bytecode at
+        # threshold 100 and would pass every other call (only the comparison of the scripts for
+        # 100 and 101 would notice). So the threshold is varied at call time.
+        cases = (
+            (200, 150, False), (200, 200, False), (200, 201, True),
+            (2000, 1500, False), (2000, 2001, True),
+            (0, 0, False), (0, 1, True), (-5, -5, False), (-5, -4, True),
+        )
+        for threshold, amount, accepted in cases:
+            with self.subTest(threshold=threshold, amount=amount):
+                result = silverscript.debug_call(SOURCE, "check", args=[amount], constructor_args=[threshold])
+                self.assertEqual(result.success, accepted)
+
     def test_refusal_points_at_the_require_statement(self):
         result = simulate(50)
         self.assertFalse(result.success)

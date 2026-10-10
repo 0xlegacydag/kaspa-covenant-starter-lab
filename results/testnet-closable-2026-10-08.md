@@ -132,7 +132,7 @@ id: the explorer lists `bb8fec12…` as accepted.
   feerate, so a changing estimate is the likely cause, not a recorded one.
 - `subtract` and the other refusals of the counting moves on a node for this
   contract; anything about two covenant inputs.
-- Nothing here was reviewed by anyone else.
+- No outside review of these runs.
 
 Nothing of these two covenants is left on testnet. The three covenants of
 2026-10-06 were not touched by this run.

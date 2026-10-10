@@ -77,6 +77,8 @@ PLAIN_SCRIPT_BYTES = bytes.fromhex(PLAIN_SCRIPT.script)
 DEFAULT_TYPE = "All"
 OTHER_TYPES = ("None", "Single", "AllAnyOneCanPay", "NoneAnyOneCanPay", "SingleAnyOneCanPay")
 MOVES = (("add", 5, 15), ("subtract", 3, 7))
+# (count, move, amount) of honest moves away from count 10 and from the amounts 3, 5 and 10.
+HONEST_ELSEWHERE = ((25, "subtract", 20), (2**40, "subtract", 2**40), (0, "add", 2**40), (2**40, "add", 1000))
 NO_NEXT_STATE = []
 
 # Rules as they are written in the contract; looked up only after behaviour is asserted.
@@ -278,10 +280,15 @@ class Compilation(unittest.TestCase):
 
     def test_helper_functions_are_unknown_to_the_call_builder(self):
         contract = silverscript.compile(CLOSABLE, [0, OWNER])
+        # `build_sig_script` knows none of the names written in a covenant contract, `add` included
+        # (only the generated entrypoint names), so it alone proves nothing about the helpers; the
+        # builder that does know the moves is asked too.
+        self.assertTrue(contract.build_sig_script_for_covenant_decl("add", [5, made_up_signature()]))
         for helper, arguments in (("onlyOwner", [made_up_signature()]), ("keepCoins", [])):
-            with self.subTest(helper=helper):
-                with self.assertRaises(silverscript.SilverScriptError):
-                    contract.build_sig_script(helper, arguments)
+            for builder in (contract.build_sig_script_for_covenant_decl, contract.build_sig_script):
+                with self.subTest(helper=helper, builder=builder.__name__):
+                    with self.assertRaises(silverscript.SilverScriptError):
+                        builder(helper, arguments)
 
     def test_owner_is_part_of_the_template_and_the_count_is_not(self):
         other = bytes.fromhex(_stranger.xonly_public_key)
@@ -307,6 +314,14 @@ class OwnerCounts(Checks):
 
     def test_owner_can_subtract_down_to_exactly_zero(self):
         self.assertTrue(move("subtract", 10, 10, [covenant(0)]).success)
+
+    def test_honest_moves_pass_at_other_counts_and_for_larger_amounts(self):
+        # No other accepted move here starts above count 10 or takes an amount above 10: a rule
+        # that is too strict beyond that would pass them all.
+        for previous, function, amount in HONEST_ELSEWHERE:
+            claimed = previous + amount if function == "add" else previous - amount
+            with self.subTest(previous=previous, function=function, amount=amount):
+                self.assertTrue(move(function, amount, previous, [covenant(claimed)]).success)
 
     def test_fee_from_a_separate_input_and_a_top_up_pass(self):
         for function, amount, count in MOVES:
@@ -363,8 +378,25 @@ class OwnerCounts(Checks):
                     result = move(function, amount, 10, [covenant(claimed)])
                     self.assert_refused_at(result, AMOUNT_RULE, occurrence)
 
+    def test_amount_rules_hold_at_every_count_and_for_any_negative_amount(self):
+        # The check above starts at count 10 and tries 0 and one small negative: a rule waived
+        # at count 0, or one letting large negatives through, would pass it.
+        for previous in (0, 1):
+            for function in ("add", "subtract"):
+                for amount in (0, -1, -101, -(2**62)):
+                    claimed = previous + amount if function == "add" else previous - amount
+                    with self.subTest(previous=previous, function=function, amount=amount):
+                        self.assertFalse(move(function, amount, previous, [covenant(claimed)]).success)
+
     def test_owner_cannot_go_below_zero(self):
         self.assert_refused_at(move("subtract", 11, 10, [covenant(-1)]), BELOW_ZERO_RULE)
+
+    def test_below_zero_rule_holds_at_other_counts_and_for_larger_amounts(self):
+        # The check above starts at count 10 and overdraws by one: a rule skipped at count 0, or
+        # for large amounts, would pass it.
+        for previous, amount in ((0, 1), (1, 2), (10, 100), (10, 2**62), (2**40, 2**40 + 1)):
+            with self.subTest(previous=previous, amount=amount):
+                self.assertFalse(move("subtract", amount, previous, [covenant(previous - amount)]).success)
 
     def test_owner_cannot_claim_a_wrong_next_state(self):
         for claimed in (14, 16):
@@ -389,6 +421,17 @@ class NobodyElseCounts(Checks):
             with self.subTest(function=function):
                 result = run(function, [amount, made_up_signature()], 10, [covenant(count)])
                 self.assert_refused_at(result, SIGNATURE_RULE)
+
+    def test_the_placeholder_signature_is_refused_in_every_move(self):
+        # 64 zero bytes and the default type: what the testnet builder puts in before signing.
+        # It passes the type rule, so only the signature rule can stop it; a made-up signature
+        # (above) is random and never equals a value a rule might special-case.
+        placeholder = bytes(64) + b"\x01"
+        for function, amount, count in MOVES:
+            with self.subTest(function=function):
+                self.assert_refused_at(run(function, [amount, placeholder], 10, [covenant(count)]), SIGNATURE_RULE)
+        with self.subTest(function="close"):
+            self.assert_refused_at(run("close", [NO_NEXT_STATE, placeholder], 10, [plain(VALUE)]), SIGNATURE_RULE)
 
     def test_without_the_owner_rule_anyone_could_count(self):
         # The comparison: in each move it is the call of the owner rule that keeps a stranger out.
@@ -465,8 +508,8 @@ class WhatTheSignatureCovers(Checks):
         transaction = [covenant(15)]
         signature = sign(10, transaction)
         self.assertTrue(run("add", [5, signature], 10, transaction).success)
-        self.assert_refused_at(run("subtract", [-5, signature], 10, transaction), AMOUNT_RULE, 2)
         self.assertFalse(run("close", [NO_NEXT_STATE, signature], 10, transaction).success)
+        self.assert_refused_at(run("subtract", [-5, signature], 10, transaction), AMOUNT_RULE, 2)
         # That `close` did not stop at the owner rule is shown by comparison, on the copy without
         # the empty-list rule: there the owner's signature for this transaction closes into its
         # continuation, and a stranger's signature for the same transaction does not.
@@ -490,6 +533,28 @@ class CloseEndsTheCovenant(Checks):
     def test_close_with_a_list_of_next_states_is_refused(self):
         self.assertFalse(close(10, [covenant(999)], next_states=[{"count": 999}]).success)
         self.assertFalse(close(10, [plain(VALUE)], next_states=[{"count": 999}]).success)
+
+    def test_close_cannot_continue_the_covenant_at_any_count(self):
+        # The checks above jump from 10 to 999. `close` has no coin rule: a continuation at the
+        # current count, or one step away, would be a move that lets coins out while the covenant
+        # lives on. Also from count 0, where no other closing check carries a next state.
+        pairs = ((10, 10), (10, 11), (10, 9), (10, 0), (10, -1), (0, 0), (0, 1), (0, -1), (0, 999))
+        shapes = (
+            ("all coins kept", lambda count: [covenant(count)]),
+            ("leak", lambda count: [covenant(count, 1000), plain(4000)]),
+        )
+        for previous, target in pairs:
+            for label, outputs in shapes:
+                with self.subTest(previous=previous, target=target, case=label):
+                    self.assertFalse(close(previous, outputs(target), next_states=[{"count": target}]).success)
+        # The comparison, looked up only after every refusal is asserted: without the
+        # empty-list rule each of these transactions passes.
+        control = without(EMPTY_LIST_RULE)
+        for previous, target in pairs:
+            for label, outputs in shapes:
+                with self.subTest(previous=previous, target=target, case=label, contract="without the rule"):
+                    result = close(previous, outputs(target), next_states=[{"count": target}], source=control)
+                    self.assertTrue(result.success)
 
     def test_without_the_empty_list_rule_close_would_set_any_count_and_let_coins_out(self):
         # The comparison: with the rule removed, the owner's `close` moves the covenant to a count

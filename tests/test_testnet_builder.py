@@ -11,6 +11,7 @@ Run from the repository root:
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
@@ -18,7 +19,16 @@ import unittest
 from unittest import mock
 
 import kaspa.experimental.silverscript as silverscript
-from kaspa import Keypair, PrivateKey, pay_to_address_script, sign_transaction
+from kaspa import (
+    Hash,
+    Keypair,
+    PrivateKey,
+    TransactionOutpoint,
+    TransactionOutput,
+    covenant_id,
+    pay_to_address_script,
+    sign_transaction,
+)
 
 from testnet import counter_live as live
 
@@ -59,6 +69,28 @@ def script_hex(tx, index: int = 0) -> str:
     return tx.outputs[index].to_dict()["scriptPublicKey"]["script"]
 
 
+def assert_same_weight(case, signed, draft, key) -> None:
+    """The real signature takes exactly the room of the placeholder the fee was worked out with.
+
+    `signed.mass == draft.mass` cannot show it: the builder copies that number
+    from the draft. So the two covenant calls are compared byte for byte in
+    length, and both transactions are measured again, the funding input signed
+    in both. The second comparison is the weaker one: the SDK's function is
+    meant for unsigned transactions (it adds one signature per input, so both
+    numbers are 66 grams above `draft.mass` when the compute mass decides),
+    and for a move paid from a large coin the storage mass decides, which does
+    not depend on the calls at all.
+    """
+    with_placeholder = sign_transaction(draft, [key], False)
+    case.assertEqual(
+        len(signed.inputs[0].signature_script_as_hex), len(with_placeholder.inputs[0].signature_script_as_hex)
+    )
+    case.assertEqual(
+        live.calculate_transaction_mass(live.NETWORK_ID, signed),
+        live.calculate_transaction_mass(live.NETWORK_ID, with_placeholder),
+    )
+
+
 class BuilderBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -95,18 +127,39 @@ class Genesis(BuilderBase):
         tx, _ = self.build_genesis()
         covenant, change = (output.to_dict().get("covenant") for output in tx.outputs)
         self.assertEqual(covenant["authorizingInput"], 0)
-        self.assertEqual(len(covenant["covenantId"]), 64)
+        # The id is the one the SDK derives from the coin being spent and the covenant's first output.
+        spent = TransactionOutpoint(Hash("aa" * 32), 0)
+        first_output = TransactionOutput(live.COVENANT_VALUE, live.lock_script(0), None)
+        self.assertEqual(covenant["covenantId"], str(covenant_id(spent, [first_output])))
         self.assertIsNone(change)
+
+    def test_the_id_of_a_genesis_transaction_is_worked_out_after_its_covenant_id(self):
+        # The SDK works out `Transaction.id` when the object is made and does not refresh it when
+        # the covenant id is filled in afterwards: on testnet a node named a genesis by another id
+        # than the one the program had printed. So the builder works the id out again, and doing it
+        # once more, or signing, changes nothing.
+        tx, _ = self.build_genesis()
+        printed = tx.id
+        self.assertEqual(str(tx.finalize()), printed)
+        self.assertEqual(str(sign_transaction(tx, [self.key], True).finalize()), printed)
 
     def test_genesis_is_signed_by_the_funding_key(self):
         tx, _ = self.build_genesis()
         signed = sign_transaction(tx, [self.key], True)
         self.assertTrue(signed.inputs[0].signature_script_as_hex)
+        # A key that does not own the funding coin cannot sign it: the signer is the funding key, not any key.
+        # On a fresh transaction: `sign_transaction` signs in place and leaves alone an input that none of
+        # the given keys fits, so on the transaction signed above a stranger's key would raise nothing.
+        fresh, _ = self.build_genesis()
+        with self.assertRaises(Exception) as raised:
+            sign_transaction(fresh, [PrivateKey(Keypair.random().private_key)], True)
+        self.assertIn("Signature is empty for input: 0", str(raised.exception))
 
     def test_funding_too_small_is_reported(self):
         small = entry("aa" * 32, 0, live.COVENANT_VALUE, self.change_script)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as raised:
             live.build(live.genesis_plan(small, self.change_script), FEERATE)
+        self.assertIn("cannot cover", str(raised.exception))  # not the other ValueError, "did not settle"
 
     def test_each_contract_gets_its_own_genesis_script(self):
         scripts = set()
@@ -157,6 +210,24 @@ class Transition(BuilderBase):
         budget = live.GRAMS_PER_COMPUTE_BUDGET_UNIT * live.COMPUTE_BUDGET * 2
         self.assertEqual(fee, (tx.mass + budget + live.FEE_MASS_SLACK) * FEERATE)
 
+    def test_the_fee_of_a_move_depends_on_the_size_of_the_funding_coin(self):
+        # The fee follows the mass the SDK measures, and for a move that mass depends on the funding
+        # coin. With 2 TKAS in the covenant it is lowest for a coin of about 1 TKAS, higher for a coin
+        # of 2 TKAS and more, and higher than at 1 TKAS for a coin of half a TKAS or less as well. The
+        # program pays with the largest coin of the acting key: among coins of 2 TKAS and more that
+        # is the dear choice, below that it need not be.
+        def fee(sompi):
+            funding = entry("aa" * 32, 0, sompi, self.change_script)
+            plan = live.transition_plan(self.covenant, funding, self.change_script, 10, "add", 5)
+            return live.build(plan, FEERATE)[1]
+
+        kas = live.SOMPI_PER_KAS
+        self.assertLess(fee(kas), fee(2 * kas))
+        self.assertLess(fee(2 * kas), fee(20 * kas))
+        self.assertLess(fee(20 * kas), fee(1000 * kas))
+        self.assertGreater(fee(1000 * kas), 4 * fee(kas))
+        self.assertGreater(fee(4 * kas // 10), 2 * fee(kas))  # here the smaller coin is the dearer one
+
     def test_a_fee_that_does_not_settle_is_reported(self):
         plan = live.transition_plan(self.covenant, self.funding, self.change_script, 10, "add", 5)
         masses = [2000, 3000] * 4  # the mass keeps jumping, so the fee never repeats
@@ -205,6 +276,7 @@ class OwnedTransition(BuilderBase):
         self.assertEqual(values(signed), values(draft))
         self.assertEqual(fee, draft_fee)
         self.assertEqual(signed.mass, draft.mass)
+        assert_same_weight(self, signed, draft, self.key)
 
     def test_only_the_owner_s_signature_passes_the_local_engine(self):
         # Two signatures never look alike, even of one key, so comparing the calls proves nothing:
@@ -358,7 +430,9 @@ class Closable(BuilderBase):
         a leak or a continuing output is shown by comparison in `test_counter_closable.py`."""
         self.assertFalse(result.success)
         lines = [number for number, line in enumerate(CLOSABLE.source.splitlines(), start=1) if rule in line]
-        self.assertEqual(len(lines), 1, f"{rule!r} is expected once in the contract source")
+        if len(lines) != 1:
+            # Not a failed assertion: a rule line that is missing says nothing about behaviour.
+            raise LookupError(f"{rule!r} is expected once in the contract source, found {len(lines)} times")
         self.assertEqual(result.failure.frames[0].line, lines[0])
 
     # --- counting moves
@@ -425,6 +499,7 @@ class Closable(BuilderBase):
         self.assertEqual(values(signed), values(draft))
         self.assertEqual(fee, draft_fee)
         self.assertEqual(signed.mass, draft.mass)
+        assert_same_weight(self, signed, draft, self.key)
 
     def test_a_contract_without_a_closing_move_cannot_be_closed(self):
         owned = entry(
@@ -506,20 +581,38 @@ class StateFiles(unittest.TestCase):
 class FakeNode:
     """Stands in for the RPC client in the checks of `submit`: answers as told.
 
-    `seen` is what it reports at any address afterwards: the ids of the
-    transactions whose outputs are "on chain".
+    `seen` is what it reports afterwards at the address `at`, and at no
+    other: the ids of the transactions whose outputs are "on chain".
+    `network` and `synced` are what it says about itself; `silent` makes that
+    question fail. `calls` are the question, the submissions and the
+    disconnects, in order; reads are not listed.
     """
 
-    def __init__(self, answer, seen=()):
+    def __init__(self, answer, seen=(), at=None, network=live.NETWORK_ID, synced=True, silent=False):
         self.answer = answer
         self.seen = seen
+        self.at = at
+        self.network, self.synced, self.silent = network, synced, silent
+        self.calls = []
+
+    async def get_server_info(self):
+        self.calls.append("what are you")
+        if self.silent:
+            raise TimeoutError()
+        return {"networkId": self.network, "isSynced": self.synced, "serverVersion": "0.0.0"}
+
+    async def disconnect(self):
+        self.calls.append("disconnect")
 
     async def submit_transaction(self, request):
+        self.calls.append("submit")
         if isinstance(self.answer, Exception):
             raise self.answer
         return {"transactionId": self.answer}
 
     async def get_utxos_by_addresses(self, request):
+        if request["addresses"] != [self.at]:
+            return {"entries": []}
         return {"entries": [{"outpoint": {"transactionId": txid, "index": 1}} for txid in self.seen]}
 
 
@@ -552,14 +645,14 @@ class Submission(BuilderBase):
 
     def test_a_lost_answer_counts_as_accepted_once_the_change_output_is_seen(self):
         tx, _ = self.transition()
-        node = FakeNode(ConnectionError("WebSocket is not connected"), seen=[tx.id])
+        node = FakeNode(ConnectionError("WebSocket is not connected"), seen=[tx.id], at=live.address_of(self.key))
         with mock.patch.object(live.asyncio, "sleep", no_sleep), mock.patch("builtins.print"):
             outcome = asyncio.run(live.submit_checked(node, tx, self.key))
         self.assertEqual(outcome, (True, tx.id))
 
     def test_a_lost_answer_stays_unknown_when_nothing_shows_up(self):
         tx, _ = self.transition()
-        node = FakeNode(ConnectionError("WebSocket is not connected"), seen=["ee" * 32])
+        node = FakeNode(ConnectionError("WebSocket is not connected"), seen=["ee" * 32], at=live.address_of(self.key))
         with mock.patch.object(live.asyncio, "sleep", no_sleep), mock.patch("builtins.print"):
             with self.assertRaises(live.NoAnswer):
                 asyncio.run(live.submit_checked(node, tx, self.key))
@@ -567,8 +660,288 @@ class Submission(BuilderBase):
     def test_a_refusal_is_not_looked_up(self):
         tx, _ = self.transition()
         text = "Rejected transaction 12ab: failed to verify the signature script"
-        node = FakeNode(RuntimeError(text), seen=[tx.id])
+        node = FakeNode(RuntimeError(text), seen=[tx.id], at=live.address_of(self.key))
         self.assertEqual(asyncio.run(live.submit_checked(node, tx, self.key)), (False, text))
+
+    def test_a_lost_answer_stays_a_lost_answer_when_the_look_up_cannot_be_made(self):
+        # The look-up may end by itself: no connection at all, or a wrong node after a reconnect.
+        # Nothing is known about the transaction then, and the user is still told so.
+        tx, _ = self.transition()
+        stops = (ConnectionError("WebSocket is not connected"), TimeoutError(), SystemExit("Refusing: a wrong node."))
+        for stop in stops:
+            with self.subTest(stop=type(stop).__name__):
+                node = FakeNode(ConnectionError("WebSocket is not connected"))
+                look_up = mock.patch.object(live, "seen_at", mock.AsyncMock(side_effect=stop))
+                with look_up, mock.patch("builtins.print"), self.assertRaises(live.NoAnswer) as raised:
+                    asyncio.run(live.submit_checked(node, tx, self.key))
+                self.assertEqual(raised.exception.txid, tx.id)
+                self.assertIn("the look-up then stopped", str(raised.exception))
+
+    def test_the_node_is_asked_what_it_is_right_before_the_transaction_is_handed_over(self):
+        tx, _ = self.transition()
+        node = FakeNode("ab" * 32)
+        asyncio.run(live.submit(node, tx))
+        self.assertEqual(node.calls, ["what are you", "submit"])
+        # A wrong or unsynced node, and a node that does not answer the question, are handed nothing.
+        cases = ((dict(network="mainnet"), "Refusing"), (dict(synced=False), "Refusing"), (dict(silent=True), "Not sent"))
+        for wrong, text in cases:
+            with self.subTest(**wrong):
+                node = FakeNode("ab" * 32, **wrong)
+                with self.assertRaises(SystemExit) as stopped:
+                    asyncio.run(live.submit(node, tx))
+                self.assertIn(text, str(stopped.exception))
+                self.assertNotIn("submit", node.calls)
+
+
+class LostGenesis(BuilderBase):
+    """`genesis` through the whole program, with a node that takes the transaction and never says so."""
+
+    def run_genesis(self, funding, printed):
+        class Node(FakeNode):
+            async def get_utxos_by_addresses(node, request):
+                # The acting key's coin before the submission; afterwards nothing shows up anywhere.
+                return {"entries": [] if "submit" in node.calls else [funding]}
+
+            async def get_fee_estimate(node):
+                return {"estimate": {"priorityBucket": {"feerate": FEERATE}}}
+
+            async def submit_transaction(node, request):
+                node.printed_before = [call.args[0] for call in printed.call_args_list]
+                node.handed = request["transaction"]
+                return await super().submit_transaction(request)
+
+        node = Node(ConnectionError("WebSocket is not connected"))
+        connected = mock.patch.object(live, "connect", mock.AsyncMock(return_value=node))
+        with connected, mock.patch.object(live, "load_key", return_value=self.key):
+            with mock.patch.object(live.asyncio, "sleep", no_sleep), self.assertRaises(SystemExit) as stopped:
+                asyncio.run(live.run(["--contract", "closable", "genesis"]))
+        return node, str(stopped.exception)
+
+    def test_the_record_is_printed_before_the_transaction_is_handed_over(self):
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"KASPA_LAB_STATE_DIR": folder}):
+            with mock.patch("builtins.print") as printed:
+                node, last_words = self.run_genesis(self.funding, printed)
+            self.assertIsNone(live.load_state(CLOSABLE))  # nothing was recorded
+            self.assertIn("NO ANSWER", last_words)
+            self.assertIn(live.state_path(CLOSABLE).name, last_words)
+            self.assertNotIn("`resync N` repairs", last_words)  # there is no record for `resync` to repair
+            lines = [line for line in node.printed_before if line.startswith("record  : ")]
+            self.assertEqual(len(lines), 1)
+            # Saved by hand, as the last words say, the printed text is a record the program loads.
+            # A text editor may put a byte order mark in front of it.
+            live.state_path(CLOSABLE).write_text(lines[0].removeprefix("record  : "), encoding="utf-8-sig")
+            record = live.load_state(CLOSABLE)
+            self.assertIn(record.txid, last_words)
+            self.assertEqual((record.count, record.value, record.owner), (0, live.COVENANT_VALUE, self.owner))
+            self.assertEqual(len(record.covenant_id), 64)
+            # It is the record of the transaction that was handed over, by the id worked out from
+            # what that transaction holds, not by the one stored in the object.
+            self.assertEqual(record.txid, str(node.handed.finalize()))
+            self.assertEqual(record.covenant_id, node.handed.outputs[0].to_dict()["covenant"]["covenantId"])
+
+    def test_a_coin_too_small_for_the_fee_ends_in_one_line_and_nothing_is_sent(self):
+        small = entry("aa" * 32, 0, live.COVENANT_VALUE, self.change_script)
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"KASPA_LAB_STATE_DIR": folder}):
+            with mock.patch("builtins.print") as printed:
+                node, last_words = self.run_genesis(small, printed)
+        self.assertEqual(last_words, "Nothing was sent: the funding input cannot cover the outputs and the fee.")
+        self.assertNotIn("submit", node.calls)
+
+
+class Ledger:
+    """A node that holds coins by address and takes what it is handed: enough to run whole commands.
+
+    `answers` are its answers to the submissions, in order: None takes the transaction, an
+    exception is raised. `unanswered` are the questions about itself, counted from 0, that it
+    leaves without an answer. `sent` are the transactions handed over; `calls` are the questions
+    about itself and the submissions, in order (reads, the fee estimate and the disconnect are not
+    listed).
+    """
+
+    def __init__(self, coins, answers=(), unanswered=()):
+        self.coins, self.answers, self.unanswered = coins, list(answers), set(unanswered)
+        self.sent, self.calls, self.questions = [], [], 0
+        self.url = "wss://ledger.example"
+
+    async def get_server_info(self):
+        self.calls.append("what are you")
+        self.questions += 1
+        if self.questions - 1 in self.unanswered:
+            raise TimeoutError("no answer")
+        return {"networkId": live.NETWORK_ID, "isSynced": True, "serverVersion": "0.0.0"}
+
+    async def disconnect(self):
+        return None
+
+    async def get_fee_estimate(self):
+        return {"estimate": {"priorityBucket": {"feerate": FEERATE}}}
+
+    async def get_utxos_by_addresses(self, request):
+        return {"entries": list(self.coins.get(request["addresses"][0], []))}
+
+    async def submit_transaction(self, request):
+        self.calls.append("submit")
+        self.sent.append(request["transaction"])
+        answer = self.answers.pop(0) if self.answers else None
+        if isinstance(answer, Exception):
+            raise answer
+        return {"transactionId": request["transaction"].id}
+
+
+class WholeCommands(BuilderBase):
+    """Commands through the whole program against a node that holds coins: what is built from, and what is recorded."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        other = Keypair.random()
+        cls.second = PrivateKey(other.private_key)
+        cls.second_funding = entry("cc" * 32, 0, FUNDING_AMOUNT, pay_to_address_script(other.to_address(live.NETWORK_TYPE)))
+
+    def world(self, held=live.COVENANT_VALUE, contract=live.KEEPING, **node_args):
+        """A record that says COVENANT_VALUE, and a node where the covenant's coin holds `held`."""
+        owner = self.owner if contract.owned else None
+        record = live.Live(COVENANT_ID, "bb" * 32, 10, live.COVENANT_VALUE, owner)
+        coin = entry("bb" * 32, 0, held, live.lock_script(10, contract, owner), covenant_id=COVENANT_ID)
+        coins = {
+            live.covenant_address(10, contract, owner): [coin],
+            live.address_of(self.key): [self.funding],
+            live.address_of(self.second): [self.second_funding],
+        }
+        return record, Ledger(coins, **node_args)
+
+    def run_command(self, argv, record, node, contract=live.KEEPING, wait=None):
+        """Returns (the record afterwards, the lines printed, the last words or None).
+
+        `wait` stands in for the wait for the transaction's output; left out, the output is there at once.
+        """
+        keys = {"KASPA_LAB_KEY_FILE": self.key, "KASPA_LAB_SECOND_KEY_FILE": self.second}
+        printed = []
+        with tempfile.TemporaryDirectory() as folder, contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {"KASPA_LAB_STATE_DIR": folder}))
+            live.save_state(contract, record)
+            stack.enter_context(mock.patch.object(live, "connect", mock.AsyncMock(return_value=node)))
+            stack.enter_context(mock.patch.object(live, "load_key", lambda name="KASPA_LAB_KEY_FILE": keys[name]))
+            stack.enter_context(mock.patch.object(live, "wait_for", wait or mock.AsyncMock()))
+            stack.enter_context(mock.patch.object(live.asyncio, "sleep", no_sleep))
+            stack.enter_context(mock.patch("builtins.print", lambda *args, **kwargs: printed.append(str(args[0]))))
+            last_words = None
+            try:
+                asyncio.run(live.run(argv))
+            except SystemExit as stop:
+                last_words = str(stop)
+            except ConnectionError as dropped:
+                last_words = repr(dropped)
+            return live.load_state(contract), printed, last_words
+
+    def test_a_move_records_what_the_coin_holds_not_what_the_file_said(self):
+        record, node = self.world(held=150_000_000)
+        after, _, _ = self.run_command(["move", "add", "5"], record, node)
+        self.assertEqual(values(node.sent[0])[0], 150_000_000)
+        self.assertEqual((after.count, after.value, after.txid), (15, 150_000_000, node.sent[0].id))
+
+    def test_a_rule_breaking_attempt_starts_from_what_the_coin_holds(self):
+        record, node = self.world(held=150_000_000)
+        after, _, _ = self.run_command(["try", "leak"], record, node)
+        self.assertEqual(values(node.sent[0])[0], 150_000_000 - live.LEAK)
+        self.assertEqual((after.count, after.value), (15, 150_000_000 - live.LEAK))
+        record, node = self.world(held=150_000_000)
+        after, _, _ = self.run_command(["try", "wrong-state"], record, node)
+        self.assertEqual((values(node.sent[0])[0], after.count, after.value), (150_000_000, 16, 150_000_000))
+
+    def test_try_leak_needs_a_coin_that_holds_more_than_it_takes(self):
+        for held in (live.LEAK, live.LEAK - 1):
+            with self.subTest(held=held):
+                record, node = self.world(held=held)
+                after, _, last_words = self.run_command(["try", "leak"], record, node)
+                self.assertIn("try leak takes", last_words)
+                self.assertEqual((node.sent, after), ([], record))
+
+    def test_the_amount_of_a_send_is_the_one_read_from_the_command_line(self):
+        record, node = self.world()
+        to = Keypair.random().to_address(live.NETWORK_TYPE).to_string()
+        self.run_command(["send", to, "0.5"], record, node)
+        self.assertEqual(values(node.sent[0])[0], 50_000_000)
+
+    def test_race_asks_the_node_before_each_submission_and_records_what_the_coin_holds(self):
+        refused = RuntimeError("Rejected transaction ab: transaction is already spent")
+        record, node = self.world(held=150_000_000, answers=[None, refused])
+        after, _, _ = self.run_command(["race"], record, node)
+        self.assertEqual(node.calls, ["what are you", "submit", "what are you", "submit"])
+        self.assertEqual((after.count, after.value, after.txid), (11, 150_000_000, node.sent[0].id))
+
+    def test_closing_through_close_continue_records_what_the_coin_holds(self):
+        record, node = self.world(held=150_000_000, contract=CLOSABLE)
+        after, _, _ = self.run_command(["--contract", "closable", "try", "close-continue"], record, node, CLOSABLE)
+        self.assertEqual((after.count, after.value), (10 + live.JUMP, 150_000_000))
+
+    def test_the_new_state_is_on_disk_before_the_wait_for_the_output(self):
+        # The connection may drop while the program waits: the record must not wait for that.
+        dropped = mock.AsyncMock(side_effect=ConnectionError("WebSocket is not connected"))
+        record, node = self.world()
+        after, _, last_words = self.run_command(["move", "add", "5"], record, node, wait=dropped)
+        self.assertIn("ConnectionError", last_words)
+        self.assertEqual((after.count, after.txid), (15, node.sent[0].id))
+        record, node = self.world(contract=CLOSABLE)
+        after, _, last_words = self.run_command(["--contract", "closable", "close"], record, node, CLOSABLE, wait=dropped)
+        self.assertIn("ConnectionError", last_words)
+        self.assertIsNone(after)  # set aside: no live record of a covenant that is gone
+
+    def test_the_advice_after_a_lost_answer_fits_the_command(self):
+        lost = ConnectionError("WebSocket is not connected")
+        record, node = self.world(answers=[lost])
+        after, _, last_words = self.run_command(["move", "add", "5"], record, node)
+        self.assertEqual(after, record)  # nothing was recorded
+        self.assertIn(node.sent[0].id, last_words)
+        self.assertIn("`resync N` repairs", last_words)
+        record, node = self.world(contract=CLOSABLE, answers=[lost])
+        after, _, last_words = self.run_command(["--contract", "closable", "close"], record, node, CLOSABLE)
+        self.assertEqual(after, record)
+        self.assertIn("move tn10-closable.json out of KASPA_LAB_STATE_DIR", last_words)
+        self.assertNotIn("`resync N` repairs", last_words)  # `resync` cannot find a covenant that is gone
+
+    def test_race_keeps_the_answer_to_the_first_move_when_the_second_is_not_sent(self):
+        # The node takes the first move and then does not say what it is: the second is not handed over.
+        record, node = self.world(unanswered={1})
+        after, printed, last_words = self.run_command(["race"], record, node)
+        self.assertEqual(node.calls, ["what are you", "submit", "what are you"])
+        self.assertTrue(any("ACCEPTED " + node.sent[0].id in line for line in printed))
+        self.assertTrue(any("NOT SENT" in line for line in printed))
+        self.assertEqual((after.count, after.txid), (11, node.sent[0].id))
+        self.assertNotIn("Nothing was sent", last_words)
+
+    def test_a_send_says_that_the_node_took_it_before_it_waits(self):
+        record, node = self.world()
+        to = Keypair.random().to_address(live.NETWORK_TYPE).to_string()
+        waited = mock.AsyncMock(side_effect=ConnectionError("WebSocket is not connected"))
+        printed = []
+        with mock.patch.object(live, "wait_for", waited), mock.patch("builtins.print", lambda *a, **k: printed.append(str(a[0]))):
+            with self.assertRaises(ConnectionError):
+                asyncio.run(live.cmd_send(node, self.key, to, 50_000_000))
+        self.assertTrue(any("ACCEPTED " + node.sent[0].id in line for line in printed))
+
+    def test_the_advice_names_the_contract_it_is_about(self):
+        lost = ConnectionError("WebSocket is not connected")
+        record, node = self.world(contract=CLOSABLE, answers=[lost])
+        _, _, last_words = self.run_command(["--contract", "closable", "close"], record, node, CLOSABLE)
+        self.assertIn("`--contract closable status`", last_words)
+        record, node = self.world(contract=CLOSABLE, answers=[lost])
+        _, _, last_words = self.run_command(["--contract", "closable", "try", "close-none"], record, node, CLOSABLE)
+        self.assertIn("move tn10-closable.json out of KASPA_LAB_STATE_DIR", last_words)
+        record, node = self.world(answers=[lost])
+        _, _, last_words = self.run_command(["move", "add", "5"], record, node)
+        self.assertIn("Run `status` before anything else", last_words)
+
+    def test_a_record_saved_from_windows_powershell_loads(self):
+        record = live.Live(COVENANT_ID, "bb" * 32, 10, live.COVENANT_VALUE)
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"KASPA_LAB_STATE_DIR": folder}):
+            path = live.state_path(live.KEEPING)
+            path.write_text(json.dumps(live.asdict(record)), encoding="utf-16")  # what `>` writes there
+            self.assertEqual(live.load_state(live.KEEPING), record)
+            path.write_text("record  : " + json.dumps(live.asdict(record)), encoding="utf-8")
+            with self.assertRaises(SystemExit) as stopped:
+                live.load_state(live.KEEPING)
+            self.assertIn(path.name, str(stopped.exception))
 
 
 class ScriptedNode:
@@ -576,15 +949,23 @@ class ScriptedNode:
 
     `replies` are the answers to `get_utxos_by_addresses`, in order; an
     exception among them is raised. `network` and `synced` are what the node
-    says about itself after a reconnect.
+    says about itself after a reconnect; `silent` is how many times it first
+    fails to say anything. `asked` are the addresses read, in order, and
+    `unchecked` counts the reads made after a reconnect before the node had
+    said what it is.
     """
 
-    def __init__(self, replies, network=live.NETWORK_ID, synced=True, rate=100):
+    def __init__(self, replies, network=live.NETWORK_ID, synced=True, rate=100, silent=0):
         self.replies = list(replies)
-        self.network, self.synced, self.rate = network, synced, rate
+        self.network, self.synced, self.rate, self.silent = network, synced, rate, silent
         self.reconnects = 0
+        self.url = "wss://scripted.example"
+        self.checked, self.unchecked = True, 0
+        self.asked = []
 
     async def get_utxos_by_addresses(self, request):
+        self.asked += request["addresses"]
+        self.unchecked += not self.checked
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
@@ -592,11 +973,16 @@ class ScriptedNode:
 
     async def connect(self):
         self.reconnects += 1
+        self.checked = False
 
     async def disconnect(self):
         return None
 
     async def get_server_info(self):
+        if self.silent:
+            self.silent -= 1
+            raise TimeoutError("no answer")
+        self.checked = True
         return {"networkId": self.network, "isSynced": self.synced, "serverVersion": "0.0.0"}
 
     async def get_fee_estimate(self):
@@ -613,7 +999,12 @@ class ReadingTheNetwork(BuilderBase):
         cls.ours = entry("bb" * 32, 0, live.COVENANT_VALUE, live.lock_script(10), covenant_id=COVENANT_ID)
 
     def found(self, entries):
-        return asyncio.run(live.find_covenant(ScriptedNode([entries]), live.KEEPING, self.record))
+        node = ScriptedNode([entries])
+        try:
+            return asyncio.run(live.find_covenant(node, live.KEEPING, self.record))
+        finally:
+            # Whatever comes of it, the one address read is the covenant's at the recorded count.
+            self.assertEqual(node.asked, [live.covenant_address(self.record.count)])
 
     def test_the_covenant_coin_is_found_by_its_transaction_and_covenant_id(self):
         self.assertEqual(self.found([self.ours]), self.ours)
@@ -638,20 +1029,48 @@ class ReadingTheNetwork(BuilderBase):
 
     def test_after_a_dropped_connection_the_node_is_asked_again_what_it_is(self):
         dropped = ConnectionError("WebSocket is not connected")
-        with mock.patch.object(live.asyncio, "sleep", no_sleep):
+        with mock.patch.object(live.asyncio, "sleep", no_sleep), mock.patch("builtins.print") as printed:
             same = ScriptedNode([dropped, [self.ours]])
             self.assertEqual(asyncio.run(live.utxos_at(same, "kaspatest:any")), [self.ours])
             self.assertEqual(same.reconnects, 1)
+            self.assertIn("wss://scripted.example, node version 0.0.0", printed.call_args.args[0])
+            self.assertEqual(same.asked, ["kaspatest:any", "kaspatest:any"])
             for wrong in (dict(network="mainnet"), dict(synced=False)):
                 with self.subTest(**wrong):
                     with self.assertRaises(SystemExit):
                         asyncio.run(live.utxos_at(ScriptedNode([dropped, [self.ours]], **wrong), "kaspatest:any"))
+
+    def test_a_node_that_does_not_say_what_it_is_is_not_read(self):
+        dropped = ConnectionError("WebSocket is not connected")
+        with mock.patch.object(live.asyncio, "sleep", no_sleep), mock.patch("builtins.print"):
+            # One question without an answer: the program reconnects and asks again before it reads.
+            once = ScriptedNode([dropped, [self.ours]], silent=1)
+            self.assertEqual(asyncio.run(live.utxos_at(once, "kaspatest:any")), [self.ours])
+            self.assertEqual((once.reconnects, once.unchecked), (2, 0))
+            # The node behind the unanswered question may be a wrong one: it is refused all the same.
+            for wrong in (dict(network="mainnet"), dict(synced=False)):
+                with self.subTest(**wrong):
+                    with self.assertRaises(SystemExit):
+                        asyncio.run(
+                            live.utxos_at(ScriptedNode([dropped, [self.ours]], silent=1, **wrong), "kaspatest:any")
+                        )
+            # A node that never answers is never read: the attempts run out.
+            never = ScriptedNode([dropped, [self.ours]], silent=9)
+            with self.assertRaises(TimeoutError):
+                asyncio.run(live.utxos_at(never, "kaspatest:any"))
+            self.assertEqual((never.replies, never.unchecked), ([[self.ours]], 0))
 
     def test_the_feerate_the_node_suggests_is_printed(self):
         with mock.patch("builtins.print") as printed:
             rate = asyncio.run(live.feerate(ScriptedNode([], rate=308)))
         self.assertEqual(rate, 308)
         self.assertIn("308", printed.call_args.args[0])
+
+    def test_a_fractional_feerate_is_rounded_up(self):
+        # A node's estimate is a fraction: rounded down, the program would pay less than it says.
+        with mock.patch("builtins.print"):
+            self.assertEqual(asyncio.run(live.feerate(ScriptedNode([], rate=308.2))), 309)
+            self.assertEqual(asyncio.run(live.feerate(ScriptedNode([], rate=100.0))), 100)
 
 
 class CommandLine(unittest.TestCase):
@@ -685,6 +1104,28 @@ class CommandLine(unittest.TestCase):
             with self.subTest(argv=argv):
                 with self.assertRaises(SystemExit):
                     live.options(argv)
+
+    def test_numbers_are_read_from_the_command_line(self):
+        self.assertEqual((live.whole("5"), live.whole("-20")), (5, -20))
+        self.assertEqual(live.sompi("20"), 20 * live.SOMPI_PER_KAS)
+        self.assertEqual(live.sompi("0.00000001"), 1)
+        for text in ("abc", "1.5", ""):
+            with self.subTest(whole=text), self.assertRaises(SystemExit):
+                live.whole(text)
+        # An amount that comes to nothing would reach the SDK as an output of zero sompi.
+        for text in ("0", "-1", "1e-9", "nan", "inf", "abc", "1,5"):
+            with self.subTest(sompi=text), self.assertRaises(SystemExit):
+                live.sompi(text)
+
+    def test_a_bad_command_line_stops_before_the_key_is_read(self):
+        # A bad number, an unknown command, a wrong count of arguments, an unknown move. Not covered:
+        # what only a command itself can tell, such as `try nonsense` or a destination on another network.
+        bad_numbers = (["move", "add", "abc"], ["resync", "x"], ["send", "kaspatest:any", "0"], ["move", "add", str(2**63)])
+        bad_shapes = (["frobnicate"], ["move", "add", "5", "extra"], ["move", "mul", "5"], ["status", "x"], ["try"])
+        with mock.patch.object(live, "load_key", side_effect=AssertionError("the key was read")):
+            for argv in bad_numbers + bad_shapes:
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    asyncio.run(live.run(argv))
 
 
 class Transfer(BuilderBase):

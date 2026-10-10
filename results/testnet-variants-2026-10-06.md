@@ -11,7 +11,7 @@ accepted transactions, three refusals) and answer what that run left open.
   covenants; the **second key** was given 20 test KAS by the first one
 - Times are UTC
 
-## 1. Control: the guide's Counter, without our rules
+## 1. Control: the guide's Counter, without the added rules
 
 Contract `contracts/counter.sil`, covenant id
 `7c7cde26d9a37438af64f45ba28e03b50a6056138a03a0cf75ff49153c30d70d`.
@@ -24,7 +24,8 @@ Contract `contracts/counter.sil`, covenant id
 
 The same two transactions were refused by KeepingCounter in the first run.
 So the difference is the contract's rules, not the way the transactions are
-built: both gaps found offline in step 2 are real on a node.
+built: both things the guide's Counter leaves unchecked (step 2 of the
+README) are visible on a node too.
 
 ## 2. OwnedCounter: only the owner's signature moves it
 
@@ -109,7 +110,7 @@ on the new state.
   difference; it does not show which line a node stopped at.
 - The race was two transactions sent seconds apart from one computer, not
   two independent users or a block-level conflict.
-- Nothing here was reviewed by anyone else.
+- No outside review of these runs.
 - The three covenants were left on testnet. The guide's Counter and
   KeepingCounter can be moved by anyone; the coins in KeepingCounter and
   OwnedCounter can never leave them — these contracts have no exit.

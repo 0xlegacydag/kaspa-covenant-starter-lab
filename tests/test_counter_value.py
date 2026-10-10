@@ -8,9 +8,9 @@ spent. The output is located through the covenant machinery
 
 How a refusal is attributed to the value rule. The line number in the
 engine's report is not enough: a failure in the compiler-generated checks
-(wrong next state, not exactly one covenant output) is reported at the last
-statement of the move, which in this contract is the value rule (in other
-contracts it is reported at other lines). So every "refused
+(wrong next state, two covenant outputs) is reported at the last `require`
+of the move, which in this contract is the value rule (in other contracts
+it is reported at other lines). So every "refused
 because of the coins" check below is a comparison: the very same transaction
 is accepted by StrictCounter, which differs from KeepingCounter only by the
 value rule.
@@ -46,6 +46,15 @@ contract NaiveCounter(int init_count) {
         require(amount > 0);
         require(tx.outputs[0].value >= tx.inputs[this.activeInputIndex].value);
         return(State { count: prev_state.count + amount });
+    }
+}
+"""
+
+# What NOT to do: an ordinary entrypoint next to the covenant declarations.
+# The compiler generates the covenant checks for the declared moves only.
+WITH_PLAIN_ENTRY = KEEPING[: KEEPING.rindex("}")] + """
+    entry escape(int amount) {
+        require(amount == amount);
     }
 }
 """
@@ -147,6 +156,24 @@ def covenant_output_second(count):
 LEAKS = (one_sompi_less, leak, leak_plain_first, leak_split_over_two_plain_outputs, leak_behind_a_big_first_output)
 HONEST = (same_value, fee_from_another_input, top_up, covenant_output_second)
 MOVES = (("add", 5, 15), ("subtract", 3, 7))
+# (count, amount) of a `subtract` that would land below zero, away from the 10 - 11 of the first check.
+OVERDRAFTS = ((0, 1), (1, 2), (10, 100), (10, 2**62), (2**40, 2**40 + 1))
+# (count, move, amount) of honest moves away from count 10 and from the amounts 3, 5 and 10.
+HONEST_ELSEWHERE = ((25, "subtract", 20), (2**40, "subtract", 2**40), (0, "add", 2**40), (2**40, "add", 1000))
+
+
+class KeepingCounterCompilation(unittest.TestCase):
+    def test_the_two_moves_are_the_only_entrypoints(self):
+        # A plain `entry` beside the moves gets none of the compiler-generated covenant checks:
+        # the engine lets it spend the covenant coin to any output, at any count, by anyone.
+        contract = silverscript.compile(KEEPING, [0])
+        self.assertEqual(
+            {entry.name: [(p.type_name, p.name) for p in entry.params] for entry in contract.abi},
+            {
+                "__covenant_entrypoint_auth_add": [("int", "amount")],
+                "__covenant_entrypoint_auth_subtract": [("int", "amount")],
+            },
+        )
 
 
 class KeepingCounterAccepts(unittest.TestCase):
@@ -158,6 +185,15 @@ class KeepingCounterAccepts(unittest.TestCase):
 
     def test_subtract_down_to_exactly_zero_passes(self):
         self.assertTrue(call(KEEPING, "subtract", 10, *same_value(0)).success)
+
+    def test_honest_moves_pass_at_other_counts_and_for_larger_amounts(self):
+        # No other accepted move here starts above count 10 or takes an amount above 10: a rule
+        # that is too strict beyond that would pass them all.
+        for previous, function, amount in HONEST_ELSEWHERE:
+            claimed = previous + amount if function == "add" else previous - amount
+            with self.subTest(previous=previous, function=function, amount=amount):
+                result = call(KEEPING, function, amount, [covenant_input(previous)], [covenant_output(claimed)])
+                self.assertTrue(result.success)
 
     def test_covenant_input_does_not_have_to_be_first(self):
         for function, amount, count in MOVES:
@@ -245,6 +281,25 @@ class KeepingCounterKeepsTheEarlierRules(unittest.TestCase):
             result.failure.frames[0].line, line_of(KEEPING, "prev_state.count - amount >= 0")
         )
 
+    def test_amount_rules_hold_at_every_count_and_for_any_negative_amount(self):
+        # The two checks of the amount rules above start at count 10 and try 0 and one small
+        # negative: a rule waived at count 0, or one letting large negatives through, would pass them.
+        for previous in (0, 1, 2**40):
+            for function in ("add", "subtract"):
+                for amount in (0, -1, -20, -101, -(2**62)):
+                    claimed = previous + amount if function == "add" else previous - amount
+                    with self.subTest(previous=previous, function=function, amount=amount):
+                        shape = [covenant_input(previous)], [covenant_output(claimed)]
+                        self.assertFalse(call(KEEPING, function, amount, *shape).success)
+
+    def test_below_zero_rule_holds_at_other_counts_and_for_larger_amounts(self):
+        # The check above starts at count 10 and overdraws by one: a rule skipped at count 0, or
+        # for large amounts, would pass it.
+        for previous, amount in OVERDRAFTS:
+            with self.subTest(previous=previous, amount=amount):
+                shape = [covenant_input(previous)], [covenant_output(previous - amount)]
+                self.assertFalse(call(KEEPING, "subtract", amount, *shape).success)
+
 
 class WhyTheOutputMustBeLocatedProperly(unittest.TestCase):
     """The naive rule on output #0 against the same scenarios."""
@@ -257,6 +312,22 @@ class WhyTheOutputMustBeLocatedProperly(unittest.TestCase):
 
     def test_naive_rule_refuses_an_honest_transition_with_another_output_first(self):
         self.assertFalse(call(NAIVE, "add", 5, *covenant_output_second(15)).success)
+
+
+class APlainEntryGetsNoCovenantChecks(unittest.TestCase):
+    """KeepingCounter with one ordinary entrypoint added: through it every rule can be walked around."""
+
+    def test_through_a_plain_entry_the_covenant_goes_anywhere(self):
+        shapes = {
+            "continued at any count": same_value(999),
+            "continued with fewer coins": leak(15),
+            "not continued at all": ([covenant_input(10)], [plain_output(VALUE)]),
+        }
+        for label, (inputs, outputs) in shapes.items():
+            with self.subTest(shape=label):
+                # The declared move refuses the transaction; the plain entry of the same contract takes it.
+                self.assertFalse(call(WITH_PLAIN_ENTRY, "add", 5, inputs, outputs).success)
+                self.assertTrue(call(WITH_PLAIN_ENTRY, "escape", 5, inputs, outputs).success)
 
 
 class StartingPoint(unittest.TestCase):

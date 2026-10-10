@@ -78,3 +78,14 @@ Rejected transaction <id>: failed to verify the signature script: script ran, bu
 The list at the top says the test coins came "from a faucet". Which service
 gave them out was not recorded. Read that line as: 1000 test KAS were
 obtained for a throwaway test address before the run.
+
+## Correction, 2026-10-10
+
+"What it does not show" says that each refused transaction "fails on the
+intended line" in the local engine. That holds for the leak (4) and the
+negative amount (6). The wrong next state (5) is reported by the engine at
+the line of the value rule, which did not cause it: a failure of the
+compiler-generated state check is reported at the last line the engine
+stepped to (README, step 3). That it is the claimed count that refuses
+transaction 5 is known from the offline checks, where the same move with
+the right count passes.

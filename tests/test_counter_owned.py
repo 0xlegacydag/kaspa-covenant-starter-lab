@@ -57,6 +57,8 @@ SOMEONE_ELSE = bytes.fromhex(_stranger.xonly_public_key)
 PLAIN_SCRIPT = pay_to_address_script(_stranger.to_address("testnet"))
 
 MOVES = (("add", 5, 15), ("subtract", 3, 7))
+# (count, move, amount) of honest moves away from count 10 and from the amounts 3, 5 and 10.
+HONEST_ELSEWHERE = ((25, "subtract", 20), (2**40, "subtract", 2**40), (0, "add", 2**40), (2**40, "add", 1000))
 
 
 def line_of(source: str, fragment: str, occurrence: int = 1) -> int:
@@ -220,11 +222,18 @@ BELOW_ZERO_LINE = "prev_state.count - amount >= 0"
 
 
 class OwnedCounterCompilation(unittest.TestCase):
-    def test_every_transition_takes_a_signature(self):
+    def test_the_two_moves_are_the_only_entrypoints_and_each_takes_a_signature(self):
+        # Exact, not "every entry has these parameters": that passes a contract whose move was
+        # renamed or is missing, and a plain `entry anyone(int amount, sig owner_sig)` beside the
+        # moves, which gets none of the covenant checks and lets anyone spend the coin anywhere.
         contract = silverscript.compile(OWNED, [0, OWNER])
-        for entry in contract.abi:
-            params = [(p.type_name, p.name) for p in entry.params]
-            self.assertEqual(params, [("int", "amount"), ("sig", "owner_sig")])
+        self.assertEqual(
+            {entry.name: [(p.type_name, p.name) for p in entry.params] for entry in contract.abi},
+            {
+                "__covenant_entrypoint_auth_add": [("int", "amount"), ("sig", "owner_sig")],
+                "__covenant_entrypoint_auth_subtract": [("int", "amount"), ("sig", "owner_sig")],
+            },
+        )
 
     def test_owner_is_part_of_the_contract_template(self):
         mine = silverscript.compile(OWNED, [0, OWNER])
@@ -239,6 +248,7 @@ class OwnedCounterCompilation(unittest.TestCase):
 
     def test_signature_argument_must_be_65_bytes(self):
         contract = silverscript.compile(OWNED, [0, OWNER])
+        self.assertTrue(contract.build_sig_script_for_covenant_decl("add", [5, bytes(65)]))  # the control
         for wrong_length in (0, 64, 66):
             with self.subTest(length=wrong_length):
                 with self.assertRaises(silverscript.SilverScriptError):
@@ -254,6 +264,14 @@ class OwnerMoves(unittest.TestCase):
 
     def test_owner_can_subtract_down_to_exactly_zero(self):
         self.assertTrue(signed_call("subtract", 10, 10, 0).success)
+
+    def test_honest_moves_pass_at_other_counts_and_for_larger_amounts(self):
+        # No other accepted move here starts above count 10 or takes an amount above 10: a rule
+        # that is too strict beyond that would pass them all.
+        for previous, function, amount in HONEST_ELSEWHERE:
+            claimed = previous + amount if function == "add" else previous - amount
+            with self.subTest(previous=previous, function=function, amount=amount):
+                self.assertTrue(signed_call(function, amount, previous, claimed).success)
 
     def test_owner_can_top_the_covenant_up(self):
         self.assertTrue(signed_call("add", 5, 10, 15, value_out=VALUE + 1000).success)
@@ -294,6 +312,14 @@ class NobodyElseMoves(unittest.TestCase):
 
     def test_malformed_signature_is_refused(self):
         self.assert_refused_at_signature_check(call("add", 5, bytes(65)), 1)
+
+    def test_placeholder_signature_of_the_default_type_is_refused(self):
+        # 64 zero bytes and the default type: what the testnet builder puts in before signing.
+        # `bytes(65)` above is stopped by the engine ("invalid hash type 0x00") before the rule
+        # decides anything; this one reaches the rule and must be refused by it, in both moves.
+        placeholder = bytes(64) + SIGHASH_ALL
+        self.assert_refused_at_signature_check(call("add", 5, placeholder), 1)
+        self.assert_refused_at_signature_check(call("subtract", 3, placeholder, claimed=7), 2)
 
     def test_signature_is_checked_before_anything_else(self):
         # Also breaks the amount rule and the value rule; the signature check comes first.
@@ -363,10 +389,27 @@ class OwnerCannotBreakTheOtherRules(unittest.TestCase):
                 self.assertFalse(result.success)
                 self.assertEqual(failing_line(result), line_of(OWNED, AMOUNT_LINE, 2))
 
+    def test_amount_rules_hold_at_every_count_and_for_any_negative_amount(self):
+        # The two checks above start at count 10 and try 0 and one small negative: a rule waived
+        # at count 0, or one letting large negatives through, would pass them both.
+        for previous in (0, 1):
+            for function in ("add", "subtract"):
+                for amount in (0, -1, -101, -(2**62)):
+                    claimed = previous + amount if function == "add" else previous - amount
+                    with self.subTest(previous=previous, function=function, amount=amount):
+                        self.assertFalse(signed_call(function, amount, previous, claimed).success)
+
     def test_owner_cannot_go_below_zero(self):
         result = signed_call("subtract", 11, 10, -1)
         self.assertFalse(result.success)
         self.assertEqual(failing_line(result), line_of(OWNED, BELOW_ZERO_LINE))
+
+    def test_below_zero_rule_holds_at_other_counts_and_for_larger_amounts(self):
+        # The check above starts at count 10 and overdraws by one: a rule skipped at count 0, or
+        # for large amounts, would pass it.
+        for previous, amount in ((0, 1), (1, 2), (10, 100), (10, 2**62), (2**40, 2**40 + 1)):
+            with self.subTest(previous=previous, amount=amount):
+                self.assertFalse(signed_call("subtract", amount, previous, previous - amount).success)
 
     def test_owner_cannot_claim_a_wrong_next_state(self):
         for claimed in (14, 16):
@@ -400,6 +443,46 @@ class SignatureScope(unittest.TestCase):
         loose = sign(10, 15, VALUE, sighash=getattr(SighashType, "None"))
         self.assertTrue(call("add", 6, loose, claimed=16).success)
         self.assertFalse(call("add", 6, loose, claimed=16, value_out=VALUE - 1).success)
+
+    def test_single_type_covers_only_the_output_at_the_input_s_own_index(self):
+        # Recorded as observed behaviour. With an ordinary output first, the covenant output is
+        # at index 1 and the covenant input at index 0: a `Single` signature then covers the
+        # ordinary output only, and whoever holds it chooses the count. The coin rule still applies.
+        shape = dict(plain_in=2000, plain_out=1700, plain_output_first=True)
+        single = sign(10, 15, VALUE, sighash=SighashType.Single, **shape)
+        self.assertTrue(call("add", 5, single, claimed=15, **shape).success)
+        self.assertTrue(call("add", 6, single, claimed=16, **shape).success)
+        self.assertFalse(call("add", 6, single, claimed=16, value_out=VALUE - 1, **shape).success)
+        # The output it does cover cannot change.
+        one_less_there = dict(shape, plain_out=1699)
+        result = call("add", 5, single, claimed=15, **one_less_there)
+        self.assertFalse(result.success)
+        self.assertEqual(failing_line(result), line_of(OWNED, SIGNATURE_LINE, 1))
+        # With the covenant output at the input's own index the same type pins the count.
+        pinned = sign(10, 15, VALUE, sighash=SighashType.Single)
+        self.assertFalse(call("add", 6, pinned, claimed=16).success)
+
+    def test_any_one_can_pay_type_lets_an_input_be_added(self):
+        # Recorded as observed behaviour: `AllAnyOneCanPay` covers every output but, of the
+        # inputs, only the signed one. An ordinary input can be added to the signed transaction;
+        # the outcome stays pinned. Under the default type the added input breaks the signature.
+        for name, added_input_passes in (("AllAnyOneCanPay", True), ("All", False)):
+            with self.subTest(sighash=name):
+                signature = sign(10, 15, VALUE, sighash=getattr(SighashType, name))
+                self.assertTrue(call("add", 5, signature, claimed=15).success)
+                self.assertEqual(call("add", 5, signature, claimed=15, plain_in=300).success, added_input_passes)
+                self.assertFalse(call("add", 6, signature, claimed=16, plain_in=300).success)
+
+    def test_default_signature_covers_the_signed_coin_s_amount_not_another_input_s(self):
+        # Recorded as observed behaviour: the signature covers the outpoint of every input, but
+        # the amount and script of the signed coin only. On chain an outpoint fixes its coin, so
+        # this is a property of the synthetic transaction, not a way around the signature.
+        signature = sign(10, 15, VALUE, plain_in=300)
+        self.assertTrue(call("add", 5, signature, claimed=15, plain_in=300).success)
+        self.assertTrue(call("add", 5, signature, claimed=15, plain_in=301).success)
+        result = call("add", 5, signature, claimed=15, plain_in=300, value_in=VALUE - 1)
+        self.assertFalse(result.success)
+        self.assertEqual(failing_line(result), line_of(OWNED, SIGNATURE_LINE, 1))
 
 
 if __name__ == "__main__":

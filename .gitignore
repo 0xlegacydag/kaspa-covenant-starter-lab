@@ -1,3 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+.env
+*.key
+*.log
+tn10-*
+.idea/
+.vscode/

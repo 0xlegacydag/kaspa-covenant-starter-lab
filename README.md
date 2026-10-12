@@ -1,5 +1,7 @@
 # Kaspa Covenant Starter Lab
 
+[![checks](https://github.com/0xlegacydag/kaspa-covenant-starter-lab/actions/workflows/checks.yml/badge.svg?branch=main&event=push)](https://github.com/0xlegacydag/kaspa-covenant-starter-lab/actions/workflows/checks.yml)
+
 A small learning exercise on native Kaspa L1 scripts written in
 [SilverScript](https://github.com/kaspanet/silverscript).
 
@@ -9,11 +11,12 @@ Steps 1–3 run offline on one computer: no network, no wallet, no coins, no
 token, no deployment. Steps 4, 5 and 6 were also run on testnet-10, with test
 coins only. Nothing here ever touched mainnet.
 
-Last successful run of the offline checks: 2026-10-10, 213 checks, all
+The offline checks were run on Windows 11 on 2026-10-10: 213 checks, all
 passing. `tools/mutation_check.py` weakens one contract rule at a time and
 reruns them: each of its 94 weakenings is noticed — 90 by a check of
 behaviour, the four that add a plain entrypoint by the check of what a
-contract exposes.
+contract exposes. The offline checks, but not that tool, are also run on
+machines hosted by GitHub on pushes to `main` (see [Run](#run)).
 
 ## At a glance
 
@@ -557,8 +560,13 @@ counting moves on a node; how much of the compute budget the script used.
 - No other dependencies; tests use the standard library
 - `kaspa` 2.1.0 supports CPython 3.10–3.14, and the 25 pinned hashes are the
   25 wheels of its release (Windows x64, macOS, glibc Linux), so the pinned
-  install is not tied to Windows. Only Windows 11 with CPython 3.12 was run
-  here
+  install is not tied to Windows. The pinned install, the offline checks and
+  the two walkthroughs are also run on machines hosted by GitHub
+  (`ubuntu-24.04` x64, `macos-26` arm64, `windows-2025` x64), with the
+  CPython 3.12 that `actions/setup-python` sets up there; each run prints
+  the exact version. The testnet program against a node and
+  `tools/mutation_check.py` were run on Windows 11 only. CPython 3.12 is the
+  only version run anywhere
 
 ## Run
 
@@ -573,15 +581,27 @@ python -m venv .venv
 These five commands were run as written on a fresh clone on 2026-10-10. On
 Linux or macOS the same should work with `python3 -m venv .venv`, with
 `.venv/bin/python` in place of `.venv\Scripts\python` and with
-`examples/...` in place of `examples\...`; that was not run. Redirected to a
-file from `cmd`, the walkthrough output has CRLF line ends; the files in
-`results/` have LF. (Windows PowerShell also re-encodes what it redirects.)
+`examples/...` in place of `examples\...`; in that form it was not run.
+Redirected to a file from `cmd`, the walkthrough output has CRLF line ends;
+the files in `results/` have LF. (Windows PowerShell also re-encodes what it
+redirects.)
 
 `tools/mutation_check.py` is run the same way. It reruns the whole suite
-once for each weakening, which took over 20 minutes here, and
+once for each weakening, which took over 20 minutes on Windows 11, and
 it edits the contract files in place while it runs, restoring them
 afterwards. A run that is killed outright can leave one contract weakened:
 `git checkout -- contracts` puts it back.
+
+[`.github/workflows/checks.yml`](.github/workflows/checks.yml) runs the
+install, the checks and the two walkthroughs on machines hosted by GitHub —
+`ubuntu-24.04`, `macos-26`, `windows-2025` — in bash, without a virtual
+environment, on pushes to `main`, on pull requests and when started by
+hand. It compares what the walkthroughs print with their output saved in
+`results/`, ignoring a carriage return at the end of a line. A green mark
+beside a commit of `main` says that the workflow's commands passed on those
+machines for that commit; for a pull request they are run on its merge with
+the base branch. The workflow does not run `tools/mutation_check.py` or the
+testnet program against a node.
 
 None of this needs a key or a node: the offline checks import the testnet
 program and hand it a made-up node. How the program itself is run — the

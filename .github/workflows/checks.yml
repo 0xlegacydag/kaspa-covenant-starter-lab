@@ -1,0 +1,54 @@
+# Runs the offline checks of this repository on machines hosted by GitHub.
+# What each command is: README.md, "Run".
+#
+# A green mark says that these commands passed on these machines. Not run
+# here: the testnet program against a node, and tools/mutation_check.py.
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  offline:
+    name: offline checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the pinned Kaspa SDK
+        run: |
+          python --version
+          python -m pip --version
+          python -m pip install --require-hashes -r requirements.txt
+
+      - name: The offline checks
+        run: python -m unittest discover -s tests -v
+
+      - name: The two walkthroughs, compared with the saved output
+        run: |
+          python examples/guard_walkthrough.py > guard.out
+          python examples/counter_walkthrough.py > counter.out
+          diff -u --strip-trailing-cr guard.out results/guard-walkthrough.txt
+          diff -u --strip-trailing-cr counter.out results/counter-walkthrough.txt
+          rm guard.out counter.out
